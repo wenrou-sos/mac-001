@@ -45,17 +45,30 @@ const sseClients = new Set();
 store.subscribe((type, payload) => {
   // 流转事件带 SSE id：浏览器重连时会通过 Last-Event-ID 头自动回传，作为补齐游标
   const idLine = type === 'transition' && payload?.event?.id ? `id: ${payload.event.id}\n` : '';
-  const data = `${idLine}event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  const frame = `${idLine}event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const res of sseClients) {
-    try { res.write(data); } catch { /* 由 close 清理 */ }
+    try {
+      // 建连期间（已注册但 hello 尚未发出）的帧先缓冲，hello 之后按序补发
+      if (res.sseBuffering) res.sseQueue.push(frame);
+      else res.write(frame);
+    } catch { /* 由 close 清理 */ }
   }
 });
 // 定期扫描 SLA（每 15s）
 const TICK_MS = 15_000;
-setInterval(() => {
+const tickTimer = setInterval(() => {
   try { store.tickAlerts(); } catch (e) { console.error('tick error', e); }
 }, TICK_MS);
-setTimeout(() => store.tickAlerts(), 500);
+tickTimer.unref();
+const bootTick = setTimeout(() => store.tickAlerts(), 500);
+bootTick.unref();
+
+// 查询参数 limit 解析：无效/非整数/小于 1 回退默认值，有效值钳制到 [1, max]
+export function parseLimit(raw, fallback = 50, max = 200) {
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 1) return fallback;
+  return Math.min(n, max);
+}
 
 // ---- HTTP 工具 ----
 function sendJson(res, status, body) {
@@ -128,7 +141,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && /^\/api\/rooms\/[^/]+\/history$/.test(p)) {
       const roomId = decodeURIComponent(p.split('/')[3]);
-      const limit = Math.min(Number(url.searchParams.get('limit') || 50), 200);
+      const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
       const events = store.history(roomId, limit);
       return sendJson(res, 200, {
         roomId,
@@ -162,8 +175,16 @@ const server = http.createServer(async (req, res) => {
       });
       // EventSource 断线重连时浏览器自动带上最后一条带 id 事件的 Last-Event-ID
       const afterId = req.headers['last-event-id'] ? String(req.headers['last-event-id']) : null;
+
+      // 关键顺序：先注册为订阅者并开启缓冲，再读取补齐数据。
+      // 这样「补齐读取窗口」内提交的流转必然二选一：进入补齐结果，或已作为实时帧缓冲；
+      // hello 发出后再按序补发缓冲帧，保证事件不丢（客户端按 id 去重避免重复展示）。
+      res.sseBuffering = true;
+      res.sseQueue = [];
+      sseClients.add(res);
+
       const feed = store.recentEvents({
-        limit: Number(url.searchParams.get('limit')) || undefined,
+        limit: parseLimit(url.searchParams.get('limit'), 50, 200),
         afterId,
       });
       const hello = {
@@ -174,8 +195,12 @@ const server = http.createServer(async (req, res) => {
       // 推进浏览器的 Last-Event-ID 游标到窗口末尾，减少下次重连的重复下发（客户端仍按 id 去重兜底）
       const helloId = feed.length ? `id: ${feed[feed.length - 1].id}\n` : '';
       res.write(`${helloId}event: hello\ndata: ${JSON.stringify(hello)}\n\n`);
-      sseClients.add(res);
+      res.sseBuffering = false;
+      for (const frame of res.sseQueue) res.write(frame);
+      res.sseQueue = null;
+
       const ping = setInterval(() => res.write(': ping\n\n'), 30_000);
+      ping.unref();
       req.on('close', () => {
         clearInterval(ping);
         sseClients.delete(res);
@@ -195,6 +220,11 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`KTV 包厢状态看板: http://localhost:${PORT}`);
-});
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  server.listen(PORT, () => {
+    console.log(`KTV 包厢状态看板: http://localhost:${PORT}`);
+  });
+}
+
+export { server, store };

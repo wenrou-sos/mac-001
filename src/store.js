@@ -314,21 +314,21 @@ export class RoomStore {
    * @param {object} o
    * @param {number} [o.limit=FEED_DEFAULT_LIMIT] 最多返回条数（硬上限 FEED_MAX_LIMIT）
    * @param {string} [o.afterId] 只返回该事件之后发生的事件（断线补齐游标）；
-   *   游标不存在或缺口超过窗口时退回为“最近 limit 条”，由客户端按 id 去重兜底
+   *   游标不存在（换库/重启后无法识别）时回退为“最近 limit 条”，由客户端按 id 去重兜底
    */
   recentEvents({ limit = FEED_DEFAULT_LIMIT, afterId = null } = {}) {
-    const max = Math.min(Math.max(Number(limit) || FEED_DEFAULT_LIMIT, 1), FEED_MAX_LIMIT);
+    const n = Number(limit);
+    const max = Number.isInteger(n) && n >= 1 ? Math.min(n, FEED_MAX_LIMIT) : FEED_DEFAULT_LIMIT;
     const all = [...this.events.values()]
       .flat()
       .sort((a, b) => {
         if (a.at !== b.at) return a.at < b.at ? -1 : 1;
         return (a.version - b.version) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
       });
-    let start = 0;
-    if (afterId) {
-      const idx = all.findIndex((e) => e.id === afterId);
-      if (idx >= 0 && all.length - 1 - idx <= max) start = idx + 1;
-    }
+    // 游标有效：从其后一条开始补齐，断线期间超过窗口时只返回最近 max 条；
+    // 游标缺失（换库/过期）：回退为最近 max 条。重复由客户端按 id 去重兜底
+    const idx = afterId ? all.findIndex((e) => e.id === afterId) : -1;
+    const start = idx >= 0 ? idx + 1 : Math.max(0, all.length - max);
     return all.slice(Math.max(start, all.length - max));
   }
 
