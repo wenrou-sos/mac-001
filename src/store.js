@@ -101,22 +101,24 @@ function slaFromEnv() {
 }
 
 // ---- 纯函数：计算动作目标状态（ROLLBACK 依赖历史） ----
-export function nextState(action, currentState, events) {
-  if (action === ACTION.ROLLBACK) {
-    // 找到最近一次非 ROLLBACK 的流转，退回到它之前的状态
-    for (let i = events.length - 1; i >= 0; i--) {
-      if (events[i].action !== ACTION.ROLLBACK) {
-        const prev = events[i].fromState;
-        if (!prev) throw new DomainError('该包厢初始即此状态，无可退回的上一步');
-        // 不允许借退回跨越关键业务节点
-        if (prev === STATE.OPEN && currentState !== STATE.INSPECTING) {
-          throw new DomainError('已开放包厢只能在检查环节退回，不允许跨节点退回');
-        }
-        return prev;
+// 异常退回的目标状态：最近一次非 ROLLBACK 流转发生之前的状态
+export function rollbackTarget(currentState, events) {
+  for (let i = events.length - 1; i >= 0; i--) {
+    if (events[i].action !== ACTION.ROLLBACK) {
+      const prev = events[i].fromState;
+      if (!prev) throw new DomainError('该包厢初始即此状态，无可退回的上一步');
+      // 不允许借退回跨越关键业务节点
+      if (prev === STATE.OPEN && currentState !== STATE.INSPECTING) {
+        throw new DomainError('已开放包厢只能在检查环节退回，不允许跨节点退回');
       }
+      return prev;
     }
-    throw new DomainError('该包厢初始即此状态，无可退回的上一步');
   }
+  throw new DomainError('该包厢初始即此状态，无可退回的上一步');
+}
+
+export function nextState(action, currentState, events) {
+  if (action === ACTION.ROLLBACK) return rollbackTarget(currentState, events);
   const [from, to] = FLOW[action];
   if (!from) throw new DomainError(`未知动作: ${action}`);
   if (currentState !== from) {
@@ -125,7 +127,7 @@ export function nextState(action, currentState, events) {
   return to;
 }
 
-// 每个状态可执行的动作（供前端按角色渲染按钮）
+// 每个状态可执行的动作（不依赖历史；ROLLBACK 是否真正可执行需结合历史判断）
 export function allowedActions(state, role) {
   const result = [];
   for (const action of Object.keys(FLOW)) {
@@ -133,6 +135,15 @@ export function allowedActions(state, role) {
   }
   if (role === ROLE.MANAGER) result.push(ACTION.ROLLBACK);
   return result;
+}
+
+// ROLLBACK 是否会产生实际的状态流转（目标状态与当前不同且可回退）
+export function canRollback(currentState, events) {
+  try {
+    return rollbackTarget(currentState, events) !== currentState;
+  } catch {
+    return false;
+  }
 }
 
 export class RoomStore {
@@ -167,6 +178,15 @@ export class RoomStore {
         this.events.get(ev.roomId)?.push(ev);
       }
       for (const [id] of this.rooms) this._rebuildRoomFromEvents(id, { touch: false });
+      // 重建幂等键索引：事件顺序即首次提交顺序，保留最早一次结果（first-wins），
+      // 否则服务重启后的同键重试会因内存索引丢失而重复执行流转
+      for (const evs of this.events.values()) {
+        for (const ev of evs) {
+          if (ev.idempotencyKey && !this.idempotency.has(ev.idempotencyKey)) {
+            this.idempotency.set(ev.idempotencyKey, { roomId: ev.roomId, event: ev });
+          }
+        }
+      }
       for (const [k, v] of Object.entries(data.alerts || {})) this.alerts.set(k, { ...v });
     } catch (e) {
       console.error('加载数据失败，使用空数据启动:', e.message);
@@ -285,6 +305,15 @@ export class RoomStore {
     return evs.slice(-limit).reverse();
   }
 
+  // 结合该包厢历史计算某角色当前实际可执行的动作；
+  // 纯状态机给经理始终展示 ROLLBACK，但退回目标等于当前状态时（如已退回到清洁中）必须收敛
+  actionsForRoom(roomId, role) {
+    const room = this.rooms.get(roomId);
+    if (!room) return [];
+    return allowedActions(room.state, role)
+      .filter((a) => a !== ACTION.ROLLBACK || canRollback(room.state, this.events.get(roomId) || []));
+  }
+
   /**
    * 执行一次状态流转
    * @param {string} roomId
@@ -340,6 +369,10 @@ export class RoomStore {
     const evs = this.events.get(roomId);
     const fromState = room.state;
     const toState = nextState(action, fromState, evs);
+    // 防御无效退回：退回到当前状态只会空转一个版本并刷新 SLA 计时，不允许写入
+    if (action === ACTION.ROLLBACK && toState === fromState) {
+      throw new DomainError('当前已是退回后的状态，不能对同一异常重复退回');
+    }
 
     let toResponsible = operator.name;
     let toResponsibleId = operator.id;

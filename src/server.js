@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   RoomStore, DomainError, STATE, ACTION, ROLE,
-  STATE_LABEL, ACTION_LABEL, ROLE_LABEL, allowedActions,
+  STATE_LABEL, ACTION_LABEL, ROLE_LABEL,
 } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -31,9 +31,9 @@ store.seedIfEmpty([
 function decorateSnapshot(snap) {
   for (const room of snap.rooms) {
     room.allowedByRole = {
-      [ROLE.FRONT]: allowedActions(room.state, ROLE.FRONT),
-      [ROLE.CLEANER]: allowedActions(room.state, ROLE.CLEANER),
-      [ROLE.MANAGER]: allowedActions(room.state, ROLE.MANAGER),
+      [ROLE.FRONT]: store.actionsForRoom(room.id, ROLE.FRONT),
+      [ROLE.CLEANER]: store.actionsForRoom(room.id, ROLE.CLEANER),
+      [ROLE.MANAGER]: store.actionsForRoom(room.id, ROLE.MANAGER),
     };
     room.stateLabel = STATE_LABEL[room.state];
   }

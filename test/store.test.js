@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  RoomStore, DomainError, STATE, ACTION, ROLE, nextState, allowedActions,
+  RoomStore, DomainError, STATE, ACTION, ROLE, nextState, allowedActions, canRollback,
 } from '../src/store.js';
 
 const FRONT = { id: 'u-front', name: '前台-小林', role: ROLE.FRONT };
@@ -212,4 +212,59 @@ test('重启后事件可重建房间状态与版本', async () => {
   // 基于重建后的版本可继续流转
   await s2.commitTransition('R7', { action: ACTION.CHECK_OUT, expectedVersion: 1 }, FRONT);
   assert.equal(s2.rooms.get('R7').state, STATE.TO_CLEAN);
+});
+
+test('重启后幂等键索引恢复：同键重试命中首次结果，不重复流转', async () => {
+  const dir = tmpDir();
+  t = 1_000_000_000_000;
+  const s1 = new RoomStore({ dir, now: clock });
+  s1.rooms.set('R8', { id: 'R8', name: 'R8' });
+  s1.events.set('R8', []);
+  s1._rebuildRoomFromEvents('R8');
+  const key = 'idem-restart-1';
+  const r1 = await s1.commitTransition(
+    'R8', { action: ACTION.CHECK_IN, expectedVersion: 0, idempotencyKey: key }, FRONT,
+  );
+  assert.equal(r1.duplicated, false);
+
+  // 模拟服务重启：网络请求实际已成功，客户端在重启后带相同键重试
+  const s2 = new RoomStore({ dir, now: clock });
+  const room = s2.rooms.get('R8');
+  assert.equal(room.version, 1);
+  const r2 = await s2.commitTransition(
+    'R8', { action: ACTION.CHECK_IN, expectedVersion: 0, idempotencyKey: key }, FRONT,
+  );
+  assert.equal(r2.duplicated, true);
+  assert.equal(r2.event.id, r1.event.id);
+  assert.equal(s2.events.get('R8').length, 1);
+  assert.equal(s2.rooms.get('R8').version, 1);
+});
+
+test('异常退回不能重复执行：退回清洁中后再次退回被拒绝且不写事件', async () => {
+  const s = freshStore();
+  await run(s, ACTION.CHECK_IN, {}, FRONT);
+  await run(s, ACTION.CHECK_OUT, {}, FRONT);
+  await run(s, ACTION.CLAIM, {}, CLEANER);
+  await run(s, ACTION.SUBMIT_CLEAN, {}, CLEANER);
+  await run(s, ACTION.ROLLBACK, { reason: '保洁误报，实际未完成' }, MANAGER);
+  assert.equal(s.rooms.get('R1').state, STATE.CLEANING);
+  const versionAfterRollback = s.rooms.get('R1').version;
+  const eventsAfterRollback = s.events.get('R1').length;
+
+  // 经理角色的动作列表中不再出现 ROLLBACK（前端不展示按钮）
+  assert.ok(!s.actionsForRoom('R1', ROLE.MANAGER).includes(ACTION.ROLLBACK));
+  assert.ok(!canRollback(STATE.CLEANING, s.events.get('R1')));
+  // 检查中仍然可以退回
+  assert.ok(canRollback(STATE.INSPECTING, s.events.get('R1').slice(0, 4)));
+
+  // 绕过前端直接提交也必须被服务端拒绝：不产生 CLEANING→CLEANING 空转事件
+  await assert.rejects(
+    run(s, ACTION.ROLLBACK, { reason: '再点一次' }, MANAGER),
+    (e) => e instanceof DomainError && /重复退回/.test(e.message),
+  );
+  assert.equal(s.events.get('R1').length, eventsAfterRollback);
+  assert.equal(s.rooms.get('R1').version, versionAfterRollback);
+  assert.equal(s.rooms.get('R1').state, STATE.CLEANING);
+  // 进入清洁中的时间不应被第二次退回刷新
+  assert.equal(s.rooms.get('R1').since, s.events.get('R1').at(-1).at);
 });
