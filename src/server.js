@@ -128,7 +128,7 @@ function operatorFromReq(req) {
     try { return decodeURIComponent(v); } catch { return v; }
   };
   return {
-    id: String(req.headers['x-user-id'] || ''),
+    id: decode(String(req.headers['x-user-id'] || '')),
     name: decode(String(req.headers['x-user-name'] || '')),
     role: String(req.headers['x-role'] || ''),
   };

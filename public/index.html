@@ -271,10 +271,24 @@ function saveIdentity() {
   localStorage.setItem('role', roleEl.value);
   localStorage.setItem('userName', nameEl.value.trim() || PRESET_NAME[roleEl.value]);
 }
+function currentOperatorName() {
+  const role = roleEl.value;
+  return nameEl.value.trim() || PRESET_NAME[role];
+}
+// 浏览器 fetch 头只接受 Latin-1（ByteString），中文名必须 percent-encode，
+// 否则构造请求即抛 Cannot convert argument to a ByteString，请求无法发出；服务端会解码
 function operator() {
   const role = roleEl.value;
-  const name = nameEl.value.trim() || PRESET_NAME[role];
-  return { 'X-Role': role, 'X-User-Name': name, 'X-User-Id': `${role}:${name}` };
+  const name = currentOperatorName();
+  return {
+    'X-Role': role,
+    'X-User-Name': encodeURIComponent(name),
+    'X-User-Id': encodeURIComponent(`${role}:${name}`),
+  };
+}
+// 本地比较用的未编码操作人 id（服务端事件中的 operatorId 是解码后的值）
+function currentOperatorId() {
+  return `${roleEl.value}:${currentOperatorName()}`;
 }
 
 // ---- 拉取 / 推送 ----
@@ -298,7 +312,7 @@ function connectSSE() {
     const { event, room } = JSON.parse(e.data);
     mergeFeed([event]);
     fetchSnapshot();
-    if (event.operatorId !== operator()['X-User-Id']) {
+    if (event.operatorId !== currentOperatorId()) {
       toast(`「${room.name}」被 ${event.operatorName} 更新：${stateLabel(event.toState)}`, 'ok');
     }
   });
@@ -308,7 +322,7 @@ function connectSSE() {
     state = state || {};
     state.alerts = data.snapshot || [];
     renderAlerts();
-    // 交接记录弹窗打开时，同步刷新其预警处理记录区
+    // 交接记录弹窗打开时，同步刷新其预警处理记录区（按包厢校验，切包厢后的过期响应丢弃）
     if (hist && document.getElementById('historyModal').classList.contains('show')) {
       renderAlertHistory(hist.roomId);
     }
@@ -523,7 +537,8 @@ async function postTransition(room, action, reason) {
 
 // ---- 交接记录：筛选 + 稳定游标分页 ----
 const PAGE_SIZE = 20;
-let hist = null; // { roomId, filters, events:Set(去重), nextCursor, loading, totalMatched }
+let hist = null; // { roomId, filters, events[], nextCursor, loading, totalMatched, gen }
+let histGen = 0; // 查询代次：切包厢 / 新筛选递增，过期异步响应必须丢弃
 
 function histFilters() {
   return {
@@ -533,15 +548,28 @@ function histFilters() {
     to: document.getElementById('fTo').value,
   };
 }
-function histQueryUrl(cursor) {
-  const f = hist.filters;
+function buildHistQueryUrl(roomId, f, cursor) {
   const q = new URLSearchParams({ limit: String(PAGE_SIZE) });
   if (cursor) q.set('cursor', cursor);
   if (f.action) q.set('action', f.action);
   if (f.operator) q.set('operator', f.operator);
   if (f.from) q.set('from', new Date(f.from).toISOString());
   if (f.to) q.set('to', new Date(f.to).toISOString());
-  return `/api/rooms/${encodeURIComponent(hist.roomId)}/history?${q}`;
+  return `/api/rooms/${encodeURIComponent(roomId)}/history?${q}`;
+}
+// 响应返回时弹窗已切到别的包厢或更新了筛选代次，则该响应为过期结果，禁止写入
+function isHistCurrent(gen, roomId) {
+  return Boolean(hist) && hist.roomId === roomId && hist.gen === gen;
+}
+// 预警处理记录与筛选无关，只按包厢守卫（切包厢后的过期响应丢弃，搜索/翻页不影响）
+function isAlertHistCurrent(roomId) {
+  return Boolean(hist) && hist.roomId === roomId;
+}
+async function fetchHistPage({ gen, roomId, filters, cursor }) {
+  const res = await fetch(buildHistQueryUrl(roomId, filters, cursor));
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || '查询失败');
+  return data;
 }
 function renderHistRows() {
   const body = document.getElementById('historyBody');
@@ -575,40 +603,53 @@ function renderHistRows() {
   if (hist.nextCursor) document.getElementById('loadMoreHist').onclick = loadMoreHist;
 }
 async function loadMoreHist() {
-  if (hist.loading || !hist.nextCursor) return;
+  if (!hist || hist.loading || !hist.nextCursor) return;
+  const gen = hist.gen;
+  const roomId = hist.roomId;
+  const cursor = hist.nextCursor; // 捕获游标，过期响应不得改它
+  const filters = hist.filters;
   hist.loading = true;
   renderHistRows();
   try {
-    const res = await fetch(histQueryUrl(hist.nextCursor));
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '加载失败');
+    const data = await fetchHistPage({ gen, roomId, filters, cursor });
+    // 切包厢 / 新筛选后此响应已过期：只丢弃，不改任何弹窗状态
+    if (!isHistCurrent(gen, roomId)) return;
     const known = new Set(hist.events.map(e => e.id));
     for (const ev of data.events) if (!known.has(ev.id)) { known.add(ev.id); hist.events.push(ev); }
     hist.nextCursor = data.nextCursor;
     hist.totalMatched = data.totalMatched;
-  } catch (e) { toast(e.message, 'error'); }
-  hist.loading = false;
-  renderHistRows();
+  } catch (e) {
+    if (isHistCurrent(gen, roomId)) toast(e.message, 'error');
+  } finally {
+    if (isHistCurrent(gen, roomId)) { hist.loading = false; renderHistRows(); }
+  }
 }
 async function runHistSearch(resetPager) {
+  // 新查询（切包厢/点查询）开新代次；翻页延续当前代次
   if (resetPager) {
     hist.filters = histFilters();
     hist.nextCursor = null;
     hist.events = [];
+    hist.gen = ++histGen;
   }
+  const gen = hist.gen;
+  const roomId = hist.roomId;
+  const filters = hist.filters;
+  const cursor = hist.nextCursor;
   hist.loading = true;
   renderHistRows();
   try {
-    const res = await fetch(histQueryUrl(hist.nextCursor));
-    const data = await res.json();
-    if (!res.ok) throw new Error(data.error || '查询失败');
-    const known = new Set(hist.events.map(e => e.id));
+    const data = await fetchHistPage({ gen, roomId, filters, cursor });
+    if (!isHistCurrent(gen, roomId)) return;
+    const known = new Set(hist.events.map(ev => ev.id));
     for (const ev of data.events) if (!known.has(ev.id)) { known.add(ev.id); hist.events.push(ev); }
     hist.nextCursor = data.nextCursor;
     hist.totalMatched = data.totalMatched;
-  } catch (e) { toast(e.message, 'error'); }
-  hist.loading = false;
-  renderHistRows();
+  } catch (e) {
+    if (isHistCurrent(gen, roomId)) toast(e.message, 'error');
+  } finally {
+    if (isHistCurrent(gen, roomId)) { hist.loading = false; renderHistRows(); }
+  }
 }
 async function renderAlertHistory(roomId) {
   const box = document.getElementById('alertHistoryBody');
@@ -616,6 +657,8 @@ async function renderAlertHistory(roomId) {
   try {
     const res = await fetch(`/api/alerts/history?roomId=${encodeURIComponent(roomId)}&limit=50`);
     const data = await res.json();
+    // 切包厢后的过期响应不得写入当前弹窗（搜索/翻页与本区无关）
+    if (!isAlertHistCurrent(roomId)) return;
     if (!data.alerts.length) { box.textContent = '暂无记录'; return; }
     box.innerHTML = data.alerts.map(a => `
       <div class="ah-item">
@@ -627,13 +670,13 @@ async function renderAlertHistory(roomId) {
         </div>
         ${a.acknowledgedByName ? `<div class="ah-note">🧰 ${escapeHtml(a.acknowledgedByName)} 于 ${new Date(a.acknowledgedAt).toLocaleString('zh-CN', { hour12: false })} 确认：${escapeHtml(a.note || '')}</div>` : '<div class="ah-muted">解除前未经经理确认</div>'}
       </div>`).join('');
-  } catch { box.textContent = '加载失败'; }
+  } catch { if (isAlertHistCurrent(roomId)) box.textContent = '加载失败'; }
 }
 
 async function showHistory(room) {
   document.getElementById('historyTitle').textContent = `${room.name} · 交接记录`;
-  // 新包厢：保留上次选择的筛选条件，由 histFilters() 读取当前控件值
-  hist = { roomId: room.id, filters: histFilters(), events: [], nextCursor: null, loading: false, totalMatched: 0 };
+  const gen = ++histGen; // 切包厢开新代次，使上一包厢在途响应失效
+  hist = { roomId: room.id, filters: histFilters(), events: [], nextCursor: null, loading: false, totalMatched: 0, gen };
   document.getElementById('historyBody').innerHTML = '';
   document.getElementById('alertHistoryBody').textContent = '加载中…';
   document.getElementById('historyPager').innerHTML = '';

@@ -332,3 +332,55 @@ test('已解除预警历史 HTTP：按包厢过滤、带状态标签', async () 
   assert.equal(r.body.alerts[0].statusLabel, '已解除');
   assert.equal(r.body.alerts[0].acknowledgedByName, '老赵');
 });
+
+test('中文操作人头 percent-encoded：确认预警与状态流转正常到达（ByteString 兼容）', async () => {
+  // 进行中预警
+  store.alerts.set('RCNA:TO_CLEAN', {
+    key: 'RCNA:TO_CLEAN', status: 'ACTIVE', roomId: 'RCNA', roomName: 'RCNA',
+    state: 'TO_CLEAN', level: 'WARNING', limitSec: 120, overdueSec: 5,
+    responsible: null, since: new Date().toISOString(), raisedAt: new Date().toISOString(),
+    note: null, acknowledgedById: null, acknowledgedByName: null, acknowledgedAt: null,
+  });
+  const cnName = '值班经理-老赵';
+  const cnId = `MANAGER:${cnName}`;
+
+  const ack = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ note: '中文备注：加急处理' });
+    const req = http.request(`${BASE}/api/alerts/RCNA%3ATO_CLEAN/ack`, {
+      method: 'POST',
+      headers: {
+        'X-Role': 'MANAGER',
+        // 模拟浏览器对非 Latin-1 头做的 percent-encode
+        'X-User-Name': encodeURIComponent(cnName),
+        'X-User-Id': encodeURIComponent(cnId),
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    }, (res) => { let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve({status:res.statusCode,body:JSON.parse(d)})); });
+    req.on('error', reject); req.end(data);
+  });
+  assert.equal(ack.status, 200);
+  assert.equal(ack.body.alert.acknowledgedByName, cnName);
+  assert.equal(ack.body.alert.acknowledgedById, cnId);
+  assert.equal(ack.body.alert.note, '中文备注：加急处理');
+
+  // 状态流转头同样解码：操作人 id 用于事件记录
+  addRoom('RCN'); // v1 OPEN->IN_USE（前台小林）
+  const tr = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ action: 'CHECK_OUT', expectedVersion: 1, idempotencyKey: 'cn-head-1' });
+    const req = http.request(`${BASE}/api/rooms/RCN/transitions`, {
+      method: 'POST',
+      headers: {
+        'X-Role': 'FRONT',
+        'X-User-Name': encodeURIComponent('前台-小林'),
+        'X-User-Id': encodeURIComponent('FRONT:前台-小林'),
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(data),
+      },
+    }, (res) => { let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve({status:res.statusCode,body:JSON.parse(d)})); });
+    req.on('error', reject); req.end(data);
+  });
+  assert.equal(tr.status, 200);
+  assert.equal(tr.body.event.operatorName, '前台-小林');
+  assert.equal(tr.body.event.operatorId, 'FRONT:前台-小林');
+});
