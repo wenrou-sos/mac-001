@@ -384,3 +384,29 @@ test('中文操作人头 percent-encoded：确认预警与状态流转正常到�
   assert.equal(tr.body.event.operatorName, '前台-小林');
   assert.equal(tr.body.event.operatorId, 'FRONT:前台-小林');
 });
+
+test('断网重试语义：同幂等键首次 duplicated:false，结果未知后重试 duplicated:true', async () => {
+  addRoom('RRT'); // v1 OPEN->IN_USE
+  const payload = { action: 'CHECK_OUT', expectedVersion: 1, idempotencyKey: 'retry-same-key' };
+
+  // 第一次：请求成功送达并执行（客户端可能因断网没收到响应）
+  const first = await post('RRT', payload);
+  assert.equal(first.status, 200);
+  assert.equal(first.body.duplicated, false);
+  assert.equal(first.body.event.version, 2);
+
+  // 用户用【原幂等键】显式重试：命中原结果，不产生新事件、版本不递增
+  const retry = await post('RRT', payload);
+  assert.equal(retry.status, 200);
+  assert.equal(retry.body.duplicated, true);
+  assert.equal(retry.body.event.id, first.body.event.id);
+  assert.equal(store.rooms.get('RRT').version, 2);
+  assert.equal(store.events.get('RRT').length, 2);
+
+  // 用户主动发起的【新操作】使用新键，正常推进版本
+  const next = await post('RRT', { action: 'CLAIM', expectedVersion: 2, idempotencyKey: 'fresh-new-key' },
+    { ...FRONT, 'X-Role': 'CLEANER', 'X-User-Id': 'u-clean', 'X-User-Name': 'wang' });
+  assert.equal(next.status, 200);
+  assert.equal(next.body.duplicated, false);
+  assert.equal(store.rooms.get('RRT').version, 3);
+});

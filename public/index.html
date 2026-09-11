@@ -38,6 +38,27 @@
   .layout { display: grid; grid-template-columns: 1fr 360px; gap: 16px; padding: 16px 20px; }
   @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
   .alerts { margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .queue-panel {
+    margin-bottom: 14px; background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 12px 14px;
+  }
+  .queue-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 10px; }
+  .queue-head h2 { font-size: 14px; display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .queue-count { font-size: 12px; color: var(--muted); font-weight: 400; }
+  .queue-filters { display: flex; gap: 8px; margin-left: auto; }
+  .queue-filters select, .queue-filters input { font-size: 12.5px; padding: 6px 8px; }
+  .alert .over { font-variant-numeric: tabular-nums; color: var(--warn); font-weight: 700; }
+  .alert.critical .over { color: var(--danger); }
+  .pending-box { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
+  .pending-item {
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+    padding: 10px 12px; border-radius: 10px; font-size: 13px;
+    background: rgba(61,90,254,.12); border: 1px solid rgba(61,90,254,.5);
+  }
+  .pending-item .ptag { font-weight: 700; color: #8fa0ff; white-space: nowrap; }
+  .pending-item .pinfo { color: var(--muted); }
+  .pending-item .pspacer { margin-left: auto; }
+  .pending-item button { font-size: 12.5px; padding: 6px 12px; }
   .alert {
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-radius: 10px;
     background: rgba(245,185,66,.12); border: 1px solid rgba(245,185,66,.4); font-size: 13px;
@@ -157,7 +178,26 @@
 
 <div class="layout">
   <main>
-    <div id="alerts" class="alerts"></div>
+    <div id="queuePanel" class="queue-panel" style="display:none">
+      <div class="queue-head">
+        <h2>🚨 SLA 预警处理队列 <span id="queueCount" class="queue-count"></span></h2>
+        <div class="queue-filters">
+          <select id="qStatus">
+            <option value="">全部状态</option>
+            <option value="ACTIVE">仅待处理</option>
+            <option value="ACKNOWLEDGED">仅处理中</option>
+          </select>
+          <select id="qLevel">
+            <option value="">全部级别</option>
+            <option value="CRITICAL">仅严重超时</option>
+            <option value="WARNING">仅超时提醒</option>
+          </select>
+          <input id="qResp" placeholder="责任人姓名" style="width:120px">
+        </div>
+      </div>
+      <div id="alerts" class="alerts"></div>
+    </div>
+    <div id="pendingOps" class="pending-box"></div>
     <div id="grid" class="grid"></div>
   </main>
   <aside class="side">
@@ -311,6 +351,13 @@ function connectSSE() {
   es.addEventListener('transition', (e) => {
     const { event, room } = JSON.parse(e.data);
     mergeFeed([event]);
+    // 待确认操作若被其他看板的实时推送证实已落库，则无需再重试
+    if (event.idempotencyKey && pendingOps.has(event.roomId) &&
+        pendingOps.get(event.roomId).idempotencyKey === event.idempotencyKey) {
+      pendingOps.delete(event.roomId);
+      renderPendingOps();
+      toast(`「${room.name}」的请求已确认成功（实时同步到达）`, 'ok');
+    }
     fetchSnapshot();
     if (event.operatorId !== currentOperatorId()) {
       toast(`「${room.name}」被 ${event.operatorName} 更新：${stateLabel(event.toState)}`, 'ok');
@@ -405,19 +452,48 @@ function actionLabel(a) {
   }[a];
 }
 
+// 当前实时超时时长（秒）：本地按“进入状态时间 - SLA”持续计算，不依赖 15s 的服务端轮询
+function liveOverdueSec(a) {
+  return Math.max(0, Math.round(elapsed(a.since) - a.limitSec));
+}
+
 function renderAlerts() {
+  const panel = document.getElementById('queuePanel');
   const box = document.getElementById('alerts');
-  const alerts = (state.alerts || []).slice().sort((a, b) =>
-    (a.level === 'CRITICAL' ? 0 : 1) - (b.level === 'CRITICAL' ? 0 : 1));
-  if (!alerts.length) { box.innerHTML = ''; return; }
+  const all = state.alerts || [];
   const isManager = roleEl.value === 'MANAGER';
+
+  // 统一预警处理队列：按状态/级别/责任人筛选，按超时程度（严重者优先、同级别超时更久优先）排序
+  const fStatus = document.getElementById('qStatus').value;
+  const fLevel = document.getElementById('qLevel').value;
+  const fResp = document.getElementById('qResp').value.trim();
+  let alerts = all.filter(a => {
+    if (fStatus && a.status !== fStatus) return false;
+    if (fLevel && a.level !== fLevel) return false;
+    if (fResp && !(a.responsible?.name || '').includes(fResp)) return false;
+    return true;
+  });
+  alerts.sort((a, b) => {
+    const sev = (x) => (x.level === 'CRITICAL' ? 1 : 0);
+    return (sev(b) - sev(a)) || (liveOverdueSec(b) - liveOverdueSec(a));
+  });
+
+  panel.style.display = all.length ? '' : 'none';
+  document.getElementById('queueCount').textContent =
+    `共 ${all.length} 条（待处理 ${all.filter(a => a.status === 'ACTIVE').length} · 处理中 ${all.filter(a => a.status === 'ACKNOWLEDGED').length}）`
+    + (alerts.length !== all.length ? `，筛选后 ${alerts.length} 条` : '');
+  if (!alerts.length) {
+    box.innerHTML = '<div style="color:var(--muted);font-size:12.5px;padding:4px 2px">当前筛选条件下没有预警</div>';
+    return;
+  }
   box.innerHTML = alerts.map(a => {
     const acked = a.status === 'ACKNOWLEDGED';
+    const over = liveOverdueSec(a);
     return `
-    <div class="alert ${a.level === 'CRITICAL' ? 'critical' : ''} ${acked ? 'ack' : ''}">
+    <div class="alert ${a.level === 'CRITICAL' ? 'critical' : ''} ${acked ? 'ack' : ''}" data-alert="${a.key}">
       <span class="tag">${a.level === 'CRITICAL' ? '⛔ 严重超时' : '⚠️ 超时提醒'}</span>
       <span class="astatus">${a.statusLabel || (acked ? '处理中' : '待处理')}</span>
-      <span><b>${a.roomName}</b> ${stateLabel(a.state)} 已超时 <b>${fmtDur(a.overdueSec)}</b>
+      <span><b>${a.roomName}</b> ${stateLabel(a.state)} 已超时 <span class="over" data-over="${a.key}">${fmtDur(over)}</span>
         （时限 ${fmtDur(a.limitSec)}），责任人：${a.responsible?.name || '—'}</span>
       <span class="time">${fmtClock(a.raisedAt)} 触发</span>
       ${isManager && !acked ? `<button class="primary ackbtn" data-ack="${a.key}">确认处理</button>` : ''}
@@ -429,6 +505,19 @@ function renderAlerts() {
   });
 }
 
+// 每秒本地刷新队列中“已持续超时”时长（无需等待服务端 SLA 轮询）
+function refreshQueueTimers() {
+  if (!state) return;
+  for (const a of state.alerts || []) {
+    const el = document.querySelector(`[data-over="${a.key}"]`);
+    if (el) el.textContent = fmtDur(liveOverdueSec(a));
+  }
+}
+
+for (const id of ['qStatus', 'qLevel', 'qResp']) {
+  document.getElementById(id).addEventListener('input', renderAlerts);
+}
+
 // ---- 预警确认（仅经理）----
 let ackKey = null;
 function openAck(key) {
@@ -436,7 +525,7 @@ function openAck(key) {
   if (!alert) return;
   ackKey = key;
   document.getElementById('ackHint').textContent =
-    `${alert.roomName} · ${stateLabel(alert.state)}超时 ${fmtDur(alert.overdueSec)}，确认后该预警标记为“处理中”并同步给所有看板。`;
+    `${alert.roomName} · ${stateLabel(alert.state)}超时 ${fmtDur(liveOverdueSec(alert))}，确认后该预警标记为“处理中”并同步给所有看板。`;
   document.getElementById('ackInput').value = '';
   document.getElementById('ackModal').classList.add('show');
   document.getElementById('ackInput').focus();
@@ -474,7 +563,6 @@ function renderFeed() {
         ${roomName(ev.roomId)} · ${actionLabel(ev.action)}
         ${ev.fromState ? `${stateLabel(ev.fromState)} → ` : ''}${stateLabel(ev.toState)}
         ${ev.reason ? ` · <span class="reason">原因：${escapeHtml(ev.reason)}</span>` : ''}
-        ${ev.idempotencyKey && ev.idempotencyKey.startsWith('idem-retry') ? ' · 重试命中' : ''}
       </div>
     </div>`).join('');
 }
@@ -510,29 +598,106 @@ document.getElementById('reasonConfirm').onclick = async () => {
 };
 function closeReason() { pending = null; document.getElementById('reasonModal').classList.remove('show'); }
 
+// ---- 状态流转：失败保留待确认操作，复用原幂等键显式重试 ----
+// 仅内存保留（刷新即清空，无法确认的临时请求不应跨会话残留）；每包厢最多一条，新操作覆盖旧的
+const pendingOps = new Map();
+const REQUEST_TIMEOUT_MS = 10_000;
+
+function newIdemKey() {
+  return 'idem-' + Math.random().toString(36).slice(2, 10);
+}
+
+// 用户主动发起的新操作：新幂等键，覆盖该包厢此前无法确认的临时请求
 async function postTransition(room, action, reason) {
-  const idem = 'idem-' + Math.random().toString(36).slice(2, 10);
+  const op = {
+    roomId: room.id,
+    roomName: room.name,
+    action,
+    expectedVersion: room.version,
+    reason: reason || null,
+    idempotencyKey: newIdemKey(),
+    lastError: null,
+  };
+  return sendTransition(op);
+}
+
+// 显式重试同一请求：必须复用原幂等键
+function retryTransition(roomId) {
+  const op = pendingOps.get(roomId);
+  if (op) return sendTransition(op);
+}
+function dismissPending(roomId) {
+  pendingOps.delete(roomId);
+  renderPendingOps();
+}
+
+async function sendTransition(op, explicitRetry = false) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  let body;
   try {
-    const res = await fetch(`/api/rooms/${room.id}/transitions`, {
+    const res = await fetch(`/api/rooms/${op.roomId}/transitions`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...operator(), 'Idempotency-Key': idem },
-      body: JSON.stringify({ action, expectedVersion: room.version, reason, idempotencyKey: idem }),
+      headers: { 'Content-Type': 'application/json', ...operator(), 'Idempotency-Key': op.idempotencyKey },
+      body: JSON.stringify({
+        action: op.action,
+        expectedVersion: op.expectedVersion,
+        reason: op.reason,
+        idempotencyKey: op.idempotencyKey,
+      }),
+      signal: controller.signal,
     });
-    const body = await res.json();
+    body = await res.json();
     if (!res.ok) {
+      clearTimeout(timer);
       if (body.code === 'VERSION_CONFLICT') {
+        // 结果明确：期间已有他人/本人成功流转，本地版本过期；丢弃待确认操作并刷新
+        pendingOps.delete(op.roomId);
+        renderPendingOps();
         toast(`⛔ ${body.error}`, 'error');
         await fetchSnapshot();
-      } else {
-        toast(body.error || '操作失败', 'error');
+        return { ok: false, conflict: true };
       }
-      return;
+      // 4xx 等确定性业务失败：服务端未执行，不保留为待确认操作
+      pendingOps.delete(op.roomId);
+      renderPendingOps();
+      toast(body.error || '操作失败', 'error');
+      return { ok: false, businessError: true };
     }
-    toast(body.duplicated ? '重复请求已幂等处理' : '操作成功', 'ok');
-    await fetchSnapshot();
   } catch (e) {
-    toast('网络错误：' + e.message, 'error');
+    clearTimeout(timer);
+    // 断网 / 超时 / 响应丢失：无法确认服务端是否已执行 → 保留原请求（含原幂等键）等待显式重试
+    op.lastError = e.name === 'AbortError' ? '请求超时，结果未知' : (`网络错误：${e.message}`);
+    pendingOps.set(op.roomId, op);
+    renderPendingOps();
+    toast(`${op.roomName}「${actionLabel(op.action)}」${op.lastError}，已保留可用原键重试`, 'warn');
+    return { ok: false, networkError: true };
   }
+  clearTimeout(timer);
+  pendingOps.delete(op.roomId);
+  renderPendingOps();
+  // 明确区分：首次成功 vs 原键重试命中原结果（后者不重复执行、不递增版本）
+  toast(body.duplicated ? '命中原结果（首次请求实际已成功），未重复执行' : '操作成功', 'ok');
+  await fetchSnapshot();
+  return { ok: true, duplicated: body.duplicated, event: body.event };
+}
+
+function renderPendingOps() {
+  const box = document.getElementById('pendingOps');
+  const ops = [...pendingOps.values()];
+  if (!ops.length) { box.innerHTML = ''; return; }
+  box.innerHTML = ops.map(op => `
+    <div class="pending-item" data-pending="${op.roomId}">
+      <span class="ptag">⏳ 结果未知</span>
+      <span><b>${escapeHtml(op.roomName)}</b>（基于 v${op.expectedVersion}）
+        「${actionLabel(op.action)}」${op.reason ? `· 原因：${escapeHtml(op.reason)}` : ''}</span>
+      <span class="pinfo">${escapeHtml(op.lastError || '请求未确认是否送达')}</span>
+      <span class="pspacer"></span>
+      <button class="primary" data-retry="${op.roomId}">用原请求重试</button>
+      <button class="ghost" data-dismiss="${op.roomId}">放弃</button>
+    </div>`).join('');
+  box.querySelectorAll('[data-retry]').forEach(b => { b.onclick = () => retryTransition(b.dataset.retry); });
+  box.querySelectorAll('[data-dismiss]').forEach(b => { b.onclick = () => dismissPending(b.dataset.dismiss); });
 }
 
 // ---- 交接记录：筛选 + 稳定游标分页 ----
@@ -708,6 +873,7 @@ setInterval(() => {
     const since = el.dataset.since;
     if (since) el.textContent = fmtDur(elapsed(since));
   });
+  refreshQueueTimers();
 }, 1000);
 
 saveIdentity();
