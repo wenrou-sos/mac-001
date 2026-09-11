@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   RoomStore, DomainError, STATE, ACTION, ROLE, nextState, allowedActions, canRollback,
+  FEED_DEFAULT_LIMIT, FEED_MAX_LIMIT,
 } from '../src/store.js';
 
 const FRONT = { id: 'u-front', name: '前台-小林', role: ROLE.FRONT };
@@ -241,6 +242,7 @@ test('重启后幂等键索引恢复：同键重试命中首次结果，不重�
 });
 
 test('异常退回不能重复执行：退回清洁中后再次退回被拒绝且不写事件', async () => {
+
   const s = freshStore();
   await run(s, ACTION.CHECK_IN, {}, FRONT);
   await run(s, ACTION.CHECK_OUT, {}, FRONT);
@@ -267,4 +269,69 @@ test('异常退回不能重复执行：退回清洁中后再次退回被拒绝�
   assert.equal(s.rooms.get('R1').state, STATE.CLEANING);
   // 进入清洁中的时间不应被第二次退回刷新
   assert.equal(s.rooms.get('R1').since, s.events.get('R1').at(-1).at);
+});
+
+function twoRoomStore() {
+  t = 1_000_000_000_000;
+  const s = new RoomStore({ dir: tmpDir(), now: clock });
+  s.rooms.set('RA', { id: 'RA', name: 'RA' });
+  s.rooms.set('RB', { id: 'RB', name: 'RB' });
+  s.events.set('RA', []);
+  s.events.set('RB', []);
+  s._rebuildRoomFromEvents('RA');
+  s._rebuildRoomFromEvents('RB');
+  return s;
+}
+
+test('全局动态：跨包厢合并、按时间正序、受 limit 上限约束', async () => {
+  const s = twoRoomStore();
+  await run(s, ACTION.CHECK_IN, { roomId: 'RA' }, FRONT);        // t+1000
+  await run(s, ACTION.CHECK_IN, { roomId: 'RB' }, FRONT);        // t+2000
+  await run(s, ACTION.CHECK_OUT, { roomId: 'RA' }, FRONT);       // t+3000
+
+  const feed = s.recentEvents();
+  assert.deepEqual(feed.map(e => e.roomId), ['RA', 'RB', 'RA']);
+  assert.ok(feed.every((e, i) => i === 0 || feed[i - 1].at <= e.at));
+
+  const limited = s.recentEvents({ limit: 2 });
+  assert.equal(limited.length, 2);
+  assert.deepEqual(limited.map(e => e.roomId), ['RB', 'RA']);
+
+  // 非法/越界 limit 归一化到默认与硬上限
+  assert.equal(s.recentEvents({ limit: 0 }).length, 3);
+  assert.equal(s.recentEvents({ limit: FEED_MAX_LIMIT + 999 }).length, 3);
+});
+
+test('全局动态：afterId 游标补齐断线期间事件，未知游标回退最近窗口', async () => {
+  const s = twoRoomStore();
+  const r1 = await run(s, ACTION.CHECK_IN, { roomId: 'RA' }, FRONT);
+  const e2 = await run(s, ACTION.CHECK_IN, { roomId: 'RB' }, FRONT);
+  const r3 = await run(s, ACTION.CHECK_OUT, { roomId: 'RA' }, FRONT);
+
+  // 客户端只收到 r1，之后断线：补齐 r1 之后的事件（正序）
+  const missed = s.recentEvents({ afterId: r1.event.id });
+  assert.equal(missed.length, 2);
+  assert.deepEqual(missed.map(e => e.id), [e2.event.id, r3.event.id]);
+  assert.ok(!missed.some(e => e.id === r1.event.id));
+
+  // 未知/过期游标（如服务重启后事件窗口外）：回退为最近 limit 条，由客户端按 id 去重
+  const fallback = s.recentEvents({ afterId: 'ev-does-not-exist', limit: 2 });
+  assert.equal(fallback.length, 2);
+  assert.equal(fallback[fallback.length - 1].id, r3.event.id);
+});
+
+test('全局动态：重启后仍可从持久化事件加载最近动态', async () => {
+  const dir = tmpDir();
+  t = 1_000_000_000_000;
+  const s1 = new RoomStore({ dir, now: clock });
+  s1.rooms.set('RN', { id: 'RN', name: 'RN' });
+  s1.events.set('RN', []);
+  s1._rebuildRoomFromEvents('RN');
+  await s1.commitTransition('RN', { action: ACTION.CHECK_IN, expectedVersion: 0 }, FRONT);
+
+  const s2 = new RoomStore({ dir, now: clock });
+  const feed = s2.recentEvents();
+  assert.equal(feed.length, 1);
+  assert.equal(feed[0].action, ACTION.CHECK_IN);
+  assert.equal(feed[0].roomId, 'RN');
 });

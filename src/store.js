@@ -74,6 +74,10 @@ const FLOW = {
 // 需要强制填写原因的动作
 const REASON_REQUIRED = new Set([ACTION.REJECT_INSPECTION, ACTION.ROLLBACK]);
 
+// 全局交接动态的数量上限：默认拉取条数 / 单次补齐硬上限（含调用方显式 limit）
+export const FEED_DEFAULT_LIMIT = 50;
+export const FEED_MAX_LIMIT = 200;
+
 // 每个状态当前阶段的责任人由事件上的哪些字段承载
 function responsibleFor(ev) {
   if (!ev) return null;
@@ -303,6 +307,29 @@ export class RoomStore {
     if (!room) throw new DomainError('包厢不存在', 404, 'NOT_FOUND');
     const evs = this.events.get(roomId) || [];
     return evs.slice(-limit).reverse();
+  }
+
+  /**
+   * 全局交接动态：跨包厢合并事件，按时间正序返回（新的在后）
+   * @param {object} o
+   * @param {number} [o.limit=FEED_DEFAULT_LIMIT] 最多返回条数（硬上限 FEED_MAX_LIMIT）
+   * @param {string} [o.afterId] 只返回该事件之后发生的事件（断线补齐游标）；
+   *   游标不存在或缺口超过窗口时退回为“最近 limit 条”，由客户端按 id 去重兜底
+   */
+  recentEvents({ limit = FEED_DEFAULT_LIMIT, afterId = null } = {}) {
+    const max = Math.min(Math.max(Number(limit) || FEED_DEFAULT_LIMIT, 1), FEED_MAX_LIMIT);
+    const all = [...this.events.values()]
+      .flat()
+      .sort((a, b) => {
+        if (a.at !== b.at) return a.at < b.at ? -1 : 1;
+        return (a.version - b.version) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+      });
+    let start = 0;
+    if (afterId) {
+      const idx = all.findIndex((e) => e.id === afterId);
+      if (idx >= 0 && all.length - 1 - idx <= max) start = idx + 1;
+    }
+    return all.slice(Math.max(start, all.length - max));
   }
 
   // 结合该包厢历史计算某角色当前实际可执行的动作；

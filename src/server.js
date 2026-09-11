@@ -43,7 +43,9 @@ function decorateSnapshot(snap) {
 // ---- SSE 客户端 ----
 const sseClients = new Set();
 store.subscribe((type, payload) => {
-  const data = `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  // 流转事件带 SSE id：浏览器重连时会通过 Last-Event-ID 头自动回传，作为补齐游标
+  const idLine = type === 'transition' && payload?.event?.id ? `id: ${payload.event.id}\n` : '';
+  const data = `${idLine}event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const res of sseClients) {
     try { res.write(data); } catch { /* 由 close 清理 */ }
   }
@@ -158,7 +160,20 @@ const server = http.createServer(async (req, res) => {
         'Cache-Control': 'no-cache',
         Connection: 'keep-alive',
       });
-      res.write(`event: hello\ndata: ${JSON.stringify(decorateSnapshot(store.snapshot()))}\n\n`);
+      // EventSource 断线重连时浏览器自动带上最后一条带 id 事件的 Last-Event-ID
+      const afterId = req.headers['last-event-id'] ? String(req.headers['last-event-id']) : null;
+      const feed = store.recentEvents({
+        limit: Number(url.searchParams.get('limit')) || undefined,
+        afterId,
+      });
+      const hello = {
+        snapshot: decorateSnapshot(store.snapshot()),
+        // 正序；首次连接为最近动态，重连为断线期间增量（游标失效时回退为最近窗口），由客户端按 id 去重
+        feed,
+      };
+      // 推进浏览器的 Last-Event-ID 游标到窗口末尾，减少下次重连的重复下发（客户端仍按 id 去重兜底）
+      const helloId = feed.length ? `id: ${feed[feed.length - 1].id}\n` : '';
+      res.write(`${helloId}event: hello\ndata: ${JSON.stringify(hello)}\n\n`);
       sseClients.add(res);
       const ping = setInterval(() => res.write(': ping\n\n'), 30_000);
       req.on('close', () => {

@@ -183,6 +183,23 @@ const ACTION_BTN_CLASS = {
 
 let state = null;
 const feedItems = [];
+const FEED_KEEP = 100; // 本地动态保留上限（服务端单次下发上限更低，防止长期运行无限堆积）
+
+// 合并服务端下发的事件（正序/倒序均可）：按事件 id 去重、按事件时间倒序、截断上限
+function mergeFeed(events) {
+  if (!events || !events.length) return;
+  const known = new Set(feedItems.map(e => e.id));
+  for (const ev of events) {
+    if (!ev?.id || known.has(ev.id)) continue;
+    known.add(ev.id);
+    feedItems.push(ev);
+  }
+  feedItems.sort((a, b) => {
+    if (a.at !== b.at) return a.at < b.at ? 1 : -1; // 新的在前
+    return (b.version - a.version) || (a.id < b.id ? 1 : -1);
+  });
+  if (feedItems.length > FEED_KEEP) feedItems.length = FEED_KEEP;
+}
 
 // ---- 身份（演示：直接由前端设置；生产由服务端会话解析）----
 const PRESET_NAME = { FRONT: '前台-小林', CLEANER: '保洁-王姐', MANAGER: '值班经理-老赵' };
@@ -211,11 +228,17 @@ async function fetchSnapshot() {
 
 function connectSSE() {
   const es = new EventSource('/api/events');
-  es.addEventListener('hello', (e) => { state = JSON.parse(e.data); setConn(true); render(); });
+  es.addEventListener('hello', (e) => {
+    // 首次打开：加载最近一段全局动态；断线重连：补齐断线期间的事件（服务端按 Last-Event-ID 增量返回）
+    const data = JSON.parse(e.data);
+    state = data.snapshot;
+    mergeFeed(data.feed);
+    setConn(true);
+    render();
+  });
   es.addEventListener('transition', (e) => {
     const { event, room } = JSON.parse(e.data);
-    feedItems.unshift(event);
-    if (feedItems.length > 100) feedItems.pop();
+    mergeFeed([event]);
     fetchSnapshot();
     if (event.operatorId !== operator()['X-User-Id']) {
       toast(`「${room.name}」被 ${event.operatorName} 更新：${stateLabel(event.toState)}`, 'ok');
