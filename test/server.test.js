@@ -11,6 +11,7 @@ process.env.DATA_DIR = TMP;
 process.env.PORT = '0';
 
 const { server, store, parseLimit } = await import('../src/server.js');
+const { ACTION } = await import('../src/store.js');
 
 await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
 const PORT = server.address().port;
@@ -218,4 +219,116 @@ test('SSE 正常连接时实时流转照常推送', async () => {
   const frames = await framesP;
   const ids = frames.filter((f) => f.event === 'transition').map((f) => f.data.event.id);
   assert.ok(ids.includes(r.body.event.id));
+});
+
+test('预警确认 HTTP：前台 403、经理确认成功并经 alerts SSE 广播', async () => {
+  // 直接构造一个进行中预警
+  store.alerts.set('RAL:TO_CLEAN', {
+    key: 'RAL:TO_CLEAN', status: 'ACTIVE', roomId: 'RAL', roomName: 'RAL',
+    state: 'TO_CLEAN', level: 'CRITICAL', limitSec: 1, overdueSec: 10,
+    responsible: { userId: 'uf', name: 'lin' }, since: new Date(Date.now() - 60000).toISOString(),
+    raisedAt: new Date().toISOString(), note: null,
+    acknowledgedById: null, acknowledgedByName: null, acknowledgedAt: null,
+  });
+
+  const forbidden = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ note: 'x' });
+    const req = http.request(`${BASE}/api/alerts/RAL%3ATO_CLEAN/ack`, {
+      method: 'POST',
+      headers: { ...FRONT, 'Content-Length': Buffer.byteLength(data) },
+    }, (res) => { let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve({status:res.statusCode,body:JSON.parse(d)})); });
+    req.on('error', reject); req.end(data);
+  });
+  assert.equal(forbidden.status, 403);
+
+  const framesP = openSSE({ ms: 700 });
+  await new Promise(r => setTimeout(r, 200));
+  const ok = await new Promise((resolve, reject) => {
+    const data = JSON.stringify({ note: '已通知保洁' });
+    const req = http.request(`${BASE}/api/alerts/RAL%3ATO_CLEAN/ack`, {
+      method: 'POST',
+      headers: { 'X-Role':'MANAGER','X-User-Name':'zhao','X-User-Id':'um','Content-Type':'application/json', 'Content-Length': Buffer.byteLength(data) },
+    }, (res) => { let d='';res.on('data',c=>d+=c);res.on('end',()=>resolve({status:res.statusCode,body:JSON.parse(d)})); });
+    req.on('error', reject); req.end(data);
+  });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.alert.status, 'ACKNOWLEDGED');
+
+  const frames = await framesP;
+  const ackChange = frames.filter(f => f.event === 'alerts')
+    .flatMap(f => f.data.changes).find(c => c.type === 'acknowledged');
+  assert.ok(ackChange, '确认事件应通过 alerts SSE 广播');
+  assert.equal(ackChange.alert.note, '已通知保洁');
+  assert.equal(ackChange.alert.statusLabel, '处理中');
+});
+
+test('交接记录 HTTP：游标分页稳定、筛选生效、非法参数 400', async () => {
+  // 注入 45 条事件
+  const evs = Array.from({ length: 45 }, (_, i) => ({
+    id: `RH-ev-${i+1}`, roomId: 'RH',
+    action: i % 2 ? ACTION.CLAIM : ACTION.CHECK_IN,
+    fromState: 'OPEN', toState: 'IN_USE',
+    operatorId: i % 3 === 0 ? 'u-clean' : 'u-front',
+    operatorName: i % 3 === 0 ? '保洁-王姐' : '前台-小林',
+    operatorRole: i % 3 === 0 ? 'CLEANER' : 'FRONT',
+    toResponsibleId: 'x', toResponsible: 'x', reason: null,
+    idempotencyKey: null, at: new Date(1_100_000_000_000 + i * 1000).toISOString(), version: i + 1,
+  }));
+  store.rooms.set('RH', { id: 'RH', name: 'RH' });
+  store.events.set('RH', evs);
+  store._rebuildRoomFromEvents('RH', { touch: false });
+
+  const p1 = await jsonGet('/api/rooms/RH/history?limit=20');
+  assert.equal(p1.body.events.length, 20);
+  assert.equal(p1.body.events[0].version, 45);
+  assert.equal(p1.body.hasMore, true);
+  assert.ok(p1.body.nextCursor);
+  assert.equal(p1.body.totalMatched, 45);
+  // 装饰字段
+  assert.ok(p1.body.events[0].actionLabel);
+  assert.equal(p1.body.filters.action, null);
+
+  // 翻页期间注入 5 条更高版本事件：游标页不受影响
+  for (let v = 46; v <= 50; v++) {
+    store.events.get('RH').push({
+      ...evs[0], id: `RH-ev-${v}`, version: v,
+      at: new Date(1_100_000_046_000 + v * 1000).toISOString(),
+    });
+  }
+  const p2 = await jsonGet(`/api/rooms/RH/history?limit=20&cursor=${p1.body.nextCursor}`);
+  assert.deepEqual(p2.body.events.map(e => e.version).slice(0, 5), [25,24,23,22,21]);
+  assert.equal(p2.body.events.length, 20);
+  const p3 = await jsonGet(`/api/rooms/RH/history?limit=20&cursor=${p2.body.nextCursor}`);
+  assert.deepEqual(p3.body.events.map(e => e.version), [5,4,3,2,1]);
+  assert.equal(p3.body.hasMore, false);
+  assert.equal(p3.body.nextCursor, null);
+
+  // 动作筛选
+  const onlyClaim = await jsonGet('/api/rooms/RH/history?action=CLAIM');
+  assert.ok(onlyClaim.body.events.every(e => e.action === 'CLAIM'));
+
+  // 操作人模糊 + 回显筛选条件
+  const byOp = await jsonGet(`/api/rooms/RH/history?operator=${encodeURIComponent('王姐')}`);
+  assert.ok(byOp.body.events.every(e => e.operatorName.includes('王姐')));
+  assert.equal(byOp.body.filters.operator, '王姐');
+
+  // 非法参数
+  assert.equal((await jsonGet('/api/rooms/RH/history?action=NOPE')).status, 400);
+  assert.equal((await jsonGet('/api/rooms/RH/history?cursor=bad')).status, 400);
+  assert.equal((await jsonGet('/api/rooms/RH/history?from=zzz')).status, 400);
+});
+
+test('已解除预警历史 HTTP：按包厢过滤、带状态标签', async () => {
+  store.resolvedAlerts.unshift({
+    key: 'RRH:TO_CLEAN', status: 'RESOLVED', roomId: 'RRH', roomName: 'RRH',
+    state: 'TO_CLEAN', level: 'WARNING', limitSec: 120, overdueSec: 5,
+    responsible: null, since: new Date().toISOString(), raisedAt: new Date().toISOString(),
+    note: '备注', acknowledgedById: 'um', acknowledgedByName: '老赵',
+    acknowledgedAt: new Date().toISOString(), resolvedAt: new Date().toISOString(),
+    resolveReason: 'state_change', resolvedByEventId: 'ev-1',
+  });
+  const r = await jsonGet('/api/alerts/history?roomId=RRH');
+  assert.equal(r.body.alerts.length, 1);
+  assert.equal(r.body.alerts[0].statusLabel, '已解除');
+  assert.equal(r.body.alerts[0].acknowledgedByName, '老赵');
 });

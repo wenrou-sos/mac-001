@@ -335,3 +335,158 @@ test('全局动态：重启后仍可从持久化事件加载最近动态', async
   assert.equal(feed[0].action, ACTION.CHECK_IN);
   assert.equal(feed[0].roomId, 'RN');
 });
+
+// ---- 交接记录游标分页 + 筛选 ----
+function eventRoom(store, id, count, actionSeq) {
+  store.rooms.set(id, { id, name: id });
+  const evs = Array.from({ length: count }, (_, i) => {
+    const v = i + 1;
+    const action = actionSeq ? actionSeq[i % actionSeq.length] : ACTION.CHECK_IN;
+    return {
+      id: `${id}-ev-${v}`, roomId: id, action,
+      fromState: STATE.OPEN, toState: STATE.IN_USE,
+      operatorId: i % 2 ? 'u-clean' : 'u-front',
+      operatorName: i % 2 ? '保洁-王姐' : '前台-小林',
+      operatorRole: i % 2 ? ROLE.CLEANER : ROLE.FRONT,
+      toResponsibleId: 'x', toResponsible: 'x', reason: i % 3 ? null : '测试原因',
+      idempotencyKey: null,
+      at: new Date(1_000_000_000_000 + v * 1000).toISOString(), version: v,
+    };
+  });
+  store.events.set(id, evs);
+  store._rebuildRoomFromEvents(id, { touch: false });
+  return evs;
+}
+
+test('queryHistory：时间倒序、游标稳定分页，翻页期间新事件不重复不跳过', () => {
+  const s = freshStore();
+  eventRoom(s, 'RP', 25);
+
+  const p1 = s.queryHistory('RP', { limit: 10 });
+  assert.deepEqual(p1.events.map(e => e.version), [25,24,23,22,21,20,19,18,17,16]);
+  assert.equal(p1.totalMatched, 25);
+  assert.ok(p1.nextCursor);
+
+  // 翻页期间新增 3 个事件（只追加更高版本，不影响已发出的游标）
+  const more = eventRoom(s, 'RP', 28).slice(-3);
+  void more;
+
+  const p2 = s.queryHistory('RP', { limit: 10, cursor: p1.nextCursor });
+  assert.deepEqual(p2.events.map(e => e.version), [15,14,13,12,11,10,9,8,7,6]);
+  const p3 = s.queryHistory('RP', { limit: 10, cursor: p2.nextCursor });
+  assert.deepEqual(p3.events.map(e => e.version), [5,4,3,2,1]);
+  assert.equal(p3.nextCursor, null); // 已到最早
+
+  // 三页无重复无遗漏（新增的 26-28 不在旧页中，重新从首页查才能看到）
+  const seen = [...p1.events, ...p2.events, ...p3.events].map(e => e.version);
+  assert.equal(new Set(seen).size, 25);
+  assert.deepEqual([...seen].sort((a,b)=>a-b), Array.from({length:25},(_,i)=>i+1));
+});
+
+test('queryHistory：动作/操作人/时间范围筛选与非法参数', () => {
+  const s = freshStore();
+  eventRoom(s, 'RF', 6, [ACTION.CHECK_IN, ACTION.CHECK_OUT]);
+
+  const byAction = s.queryHistory('RF', { action: 'CHECK_IN' });
+  assert.ok(byAction.events.every(e => e.action === ACTION.CHECK_IN));
+  assert.equal(byAction.totalMatched, 3);
+
+  const byActions = s.queryHistory('RF', { action: 'CHECK_IN,CHECK_OUT' });
+  assert.equal(byActions.totalMatched, 6);
+
+  const byName = s.queryHistory('RF', { operatorName: '王姐' });
+  assert.ok(byName.events.every(e => e.operatorName.includes('王姐')));
+  assert.equal(byName.totalMatched, 3);
+
+  const byId = s.queryHistory('RF', { operatorId: 'u-front' });
+  assert.ok(byId.events.every(e => e.operatorId === 'u-front'));
+
+  // 时间范围：取第 2..4 条（at = base + v*1000）
+  const ranged = s.queryHistory('RF', {
+    from: new Date(1_000_000_001_500).toISOString(),
+    to: new Date(1_000_000_004_500).toISOString(),
+  });
+  assert.deepEqual(ranged.events.map(e => e.version).sort((a,b)=>a-b), [2,3,4]);
+
+  assert.throws(() => s.queryHistory('RF', { action: 'NOPE' }), /未知动作/);
+  assert.throws(() => s.queryHistory('RF', { from: 'bad' }), /起始时间无效/);
+  assert.throws(() => s.queryHistory('RF', { cursor: '!!!' }), /游标/);
+  assert.throws(() => s.queryHistory('MISSING', {}), e => e.status === 404);
+});
+
+// ---- 预警确认与解除历史 ----
+test('预警确认：仅经理可确认，确认信息保留至自动解除后的历史', async () => {
+  const s = new RoomStore({ dir: tmpDir(), now: clock });
+  s.rooms.set('RA', { id: 'RA', name: 'RA' });
+  s.events.set('RA', []);
+  s._rebuildRoomFromEvents('RA');
+  await run(s, ACTION.CHECK_IN, { roomId: 'RA' }, FRONT);
+  await run(s, ACTION.CHECK_OUT, { roomId: 'RA' }, FRONT); // TO_CLEAN
+
+  t += 121_000;
+  s.tickAlerts();
+  const key = 'RA:TO_CLEAN';
+  assert.ok(s.alerts.has(key));
+  assert.equal(s.alerts.get(key).status, 'ACTIVE');
+
+  // 前台/保洁无权确认
+  assert.throws(() => s.acknowledgeAlert(key, '处理中', FRONT), e => e.status === 403);
+  assert.throws(() => s.acknowledgeAlert(key, '处理中', CLEANER), e => e.status === 403);
+  assert.throws(() => s.acknowledgeAlert(key, '  ', MANAGER), /处理备注/);
+
+  const ack = s.acknowledgeAlert(key, '已联系保洁加急', MANAGER);
+  assert.equal(ack.status, 'ACKNOWLEDGED');
+  assert.equal(ack.acknowledgedByName, MANAGER.name);
+  assert.equal(ack.note, '已联系保洁加急');
+  assert.ok(ack.acknowledgedAt);
+
+  // 已确认后仅更新备注，确认时间不变
+  const firstAckAt = ack.acknowledgedAt;
+  t += 10_000;
+  const ack2 = s.acknowledgeAlert(key, '保洁已到场', MANAGER);
+  assert.equal(ack2.note, '保洁已到场');
+  assert.equal(ack2.acknowledgedAt, firstAckAt);
+
+  assert.throws(() => s.acknowledgeAlert('RA:NOPE', 'x', MANAGER), e => e.status === 404);
+
+  // 状态流转自动解除，确认信息进入历史
+  await run(s, ACTION.CLAIM, { roomId: 'RA' }, CLEANER);
+  assert.ok(!s.alerts.has(key));
+  const histAlerts = s.alertHistory('RA');
+  assert.equal(histAlerts.length, 1);
+  assert.equal(histAlerts[0].status, 'RESOLVED');
+  assert.equal(histAlerts[0].acknowledgedByName, MANAGER.name);
+  assert.equal(histAlerts[0].note, '保洁已到场');
+  assert.equal(histAlerts[0].resolveReason, 'state_change');
+  assert.ok(histAlerts[0].resolvedByEventId);
+});
+
+test('已解除预警历史有上限（RESOLVED_ALERTS_MAX）', () => {
+  const s = new RoomStore({ dir: tmpDir(), now: clock });
+  for (let i = 0; i < 205; i++) {
+    s.alerts.set(`R${i}:X`, { key: `R${i}:X`, roomId: `R${i}`, status: 'ACTIVE' });
+    s._resolveRoomAlerts(`R${i}`, { reason: 'state_change' });
+  }
+  assert.equal(s.resolvedAlerts.length, 200);
+});
+
+test('预警确认状态持久化：重启后进行中预警仍为处理中，已解除记录保留', async () => {
+  const dir = tmpDir();
+  t = 1_000_000_000_000;
+  const s1 = new RoomStore({ dir, now: clock });
+  s1.rooms.set('RP', { id: 'RP', name: 'RP' });
+  s1.events.set('RP', []);
+  s1._rebuildRoomFromEvents('RP');
+  await s1.commitTransition('RP', { action: ACTION.CHECK_IN, expectedVersion: 0 }, FRONT);
+  await s1.commitTransition('RP', { action: ACTION.CHECK_OUT, expectedVersion: 1 }, FRONT);
+  t += 121_000;
+  s1.tickAlerts();
+  s1.acknowledgeAlert('RP:TO_CLEAN', '跟进中', MANAGER);
+
+  const s2 = new RoomStore({ dir, now: clock });
+  const a = s2.alerts.get('RP:TO_CLEAN');
+  assert.ok(a);
+  assert.equal(a.status, 'ACKNOWLEDGED');
+  assert.equal(a.note, '跟进中');
+  assert.equal(a.acknowledgedByName, MANAGER.name);
+});

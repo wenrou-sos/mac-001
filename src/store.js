@@ -48,6 +48,21 @@ export const ROLE = {
 
 export const ROLE_LABEL = { FRONT: '前台', CLEANER: '保洁', MANAGER: '值班经理' };
 
+export const ALERT_STATUS = {
+  ACTIVE: 'ACTIVE',             // 待处理
+  ACKNOWLEDGED: 'ACKNOWLEDGED', // 处理中（经理已确认）
+  RESOLVED: 'RESOLVED',         // 已解除（状态流转自动解除）
+};
+
+export const ALERT_STATUS_LABEL = {
+  ACTIVE: '待处理',
+  ACKNOWLEDGED: '处理中',
+  RESOLVED: '已解除',
+};
+
+// 已解除预警历史的保留上限（内存 + 持久化），避免长期运行无限增长
+export const RESOLVED_ALERTS_MAX = 200;
+
 // 各动作允许的角色
 const ACTION_ROLES = {
   CHECK_IN: [ROLE.FRONT],
@@ -90,6 +105,14 @@ export class DomainError extends Error {
     this.status = status;
     this.code = code;
   }
+}
+
+// 解析筛选时间：接受 ISO 字符串或毫秒数；空值返回 null，非法值抛错
+function parseTimeMs(raw, message) {
+  if (raw === undefined || raw === null || raw === '') return null;
+  const ms = typeof raw === 'number' ? raw : Date.parse(raw);
+  if (!Number.isFinite(ms)) throw new DomainError(message, 400, 'BAD_FILTER');
+  return ms;
 }
 
 function slaFromEnv() {
@@ -160,7 +183,8 @@ export class RoomStore {
     this.events = new Map();      // id -> event[]
     this.idempotency = new Map(); // key -> {roomId, event}
     this.locks = new Map();       // roomId -> Promise 链（串行化同包厢写入）
-    this.alerts = new Map();      // `${roomId}:${state}` -> alert
+    this.alerts = new Map();       // key -> 进行中的预警（ACTIVE / ACKNOWLEDGED）
+    this.resolvedAlerts = [];      // 已解除预警（含处理信息），按解除时间倒序、有上限
     this.listeners = new Set();
     this._load();
   }
@@ -191,7 +215,12 @@ export class RoomStore {
           }
         }
       }
-      for (const [k, v] of Object.entries(data.alerts || {})) this.alerts.set(k, { ...v });
+      for (const [k, v] of Object.entries(data.alerts || {})) {
+        this.alerts.set(k, { status: ALERT_STATUS.ACTIVE, ...v });
+      }
+      // 已解除预警（旧数据文件无此字段）：按解除时间倒序恢复并截断上限
+      this.resolvedAlerts = (data.resolvedAlerts || [])
+        .slice(0, RESOLVED_ALERTS_MAX);
     } catch (e) {
       console.error('加载数据失败，使用空数据启动:', e.message);
     }
@@ -202,6 +231,7 @@ export class RoomStore {
       rooms: [...this.rooms.values()].map(({ id, name }) => ({ id, name })),
       events: [...this.events.values()].flat(),
       alerts: Object.fromEntries(this.alerts),
+      resolvedAlerts: this.resolvedAlerts,
     };
     const tmp = this._file() + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(data));
@@ -299,6 +329,7 @@ export class RoomStore {
       sla: this.sla,
       rooms: [...this.rooms.values()].map((r) => ({ ...r })),
       alerts: [...this.alerts.values()],
+      resolvedAlerts: this.resolvedAlerts.slice(0, 20),
     };
   }
 
@@ -307,6 +338,85 @@ export class RoomStore {
     if (!room) throw new DomainError('包厢不存在', 404, 'NOT_FOUND');
     const evs = this.events.get(roomId) || [];
     return evs.slice(-limit).reverse();
+  }
+
+  // 分页游标：同包厢版本单调递增，按 version 做 keyset 分页；
+  // 翻页期间新事件只追加在更高版本，已发出的游标位置永不移动（不会重复/跳过）
+  static encodeCursor(version) {
+    return Buffer.from(JSON.stringify({ v: version }))
+      .toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  }
+  static decodeCursor(cursor) {
+    if (!cursor) return null;
+    try {
+      const b64 = String(cursor).replace(/-/g, '+').replace(/_/g, '/');
+      const { v } = JSON.parse(Buffer.from(b64, 'base64').toString('utf8'));
+      return Number.isInteger(v) && v >= 0 ? v : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 交接记录查询：按事件时间倒序（即版本倒序），keyset 游标稳定分页
+   * @param {string} roomId
+   * @param {object} q {limit, cursor, action, operatorId, operatorName, from, to}
+   *   - action：动作精确匹配（可多个）；operatorId 精确 / operatorName 模糊（任一命中）
+   *   - from/to：ISO 时间或毫秒，按事件时间闭区间过滤
+   * @returns {{events, nextCursor, totalMatched, limit}}
+   */
+  queryHistory(roomId, q = {}) {
+    const room = this.rooms.get(roomId);
+    if (!room) throw new DomainError('包厢不存在', 404, 'NOT_FOUND');
+
+    const n = Number(q.limit);
+    const max = Number.isInteger(n) && n >= 1 ? Math.min(n, FEED_MAX_LIMIT) : FEED_DEFAULT_LIMIT;
+    const cursorVersion = q.cursor == null ? null : RoomStore.decodeCursor(q.cursor);
+    if (q.cursor != null && cursorVersion === null) {
+      throw new DomainError('分页游标无效', 400, 'BAD_CURSOR');
+    }
+
+    const actions = (q.action == null ? [] : String(q.action).split(',').map((s) => s.trim()).filter(Boolean));
+    for (const a of actions) {
+      if (!ACTION[a]) throw new DomainError(`未知动作筛选: ${a}`, 400, 'BAD_FILTER');
+    }
+    const actionSet = new Set(actions);
+    const operatorId = q.operatorId ? String(q.operatorId) : null;
+    const operatorName = q.operatorName ? String(q.operatorName).trim() : null;
+    const fromMs = parseTimeMs(q.from, '起始时间无效');
+    const toMs = parseTimeMs(q.to, '结束时间无效');
+    if (fromMs !== null && toMs !== null && fromMs > toMs) {
+      throw new DomainError('起始时间不能晚于结束时间', 400, 'BAD_FILTER');
+    }
+
+    const evs = (this.events.get(roomId) || []).filter((e) => {
+      if (actionSet.size && !actionSet.has(e.action)) return false;
+      if (operatorId && e.operatorId !== operatorId) return false;
+      if (operatorName && !(e.operatorName || '').includes(operatorName)) return false;
+      const ms = Date.parse(e.at);
+      if (fromMs !== null && ms < fromMs) return false;
+      if (toMs !== null && ms > toMs) return false;
+      return true;
+    });
+
+    // 版本倒序；首页取当前游标以下（首次为最新版本以下全部），后续页严格小于上一页末条版本
+    let cutoff = cursorVersion;
+    if (cutoff === null) cutoff = Number.POSITIVE_INFINITY;
+    const candidates = evs
+      .filter((e) => e.version < cutoff)
+      .sort((a, b) => (b.version - a.version) || (a.at < b.at ? 1 : -1));
+    // 多取 1 条探测是否还有更早记录，避免末页仍返回游标导致客户端多发一次空页
+    const hasMore = candidates.length > max;
+    const page = candidates.slice(0, max);
+    const last = page[page.length - 1];
+
+    return {
+      events: page,
+      nextCursor: hasMore && last ? RoomStore.encodeCursor(last.version) : null,
+      totalMatched: evs.length,
+      limit: max,
+    };
   }
 
   /**
@@ -443,14 +553,18 @@ export class RoomStore {
     this._rebuildRoomFromEvents(roomId);
     if (idemKey) this.idempotency.set(idemKey, { roomId, event });
 
-    // 流转后清除本包厢旧预警（tick 会按新状态重新评估）
-    for (const key of [...this.alerts.keys()]) {
-      if (key.startsWith(`${roomId}:`)) this.alerts.delete(key);
-    }
+    // 流转后自动解除本包厢预警（tick 会按新状态重新评估），连同确认/备注信息转入历史
+    const changes = this._resolveRoomAlerts(roomId, {
+      reason: 'state_change',
+      eventId: event.id,
+    });
 
     this._persist();
     this._emit('transition', { event, room: { ...room } });
-    this._evaluateAlerts(true);
+    changes.push(...this._evaluateAlerts());
+    if (changes.length) {
+      this._emit('alerts', { changes, snapshot: this.snapshot().alerts });
+    }
     return { event, duplicated: false };
   }
 
@@ -458,12 +572,83 @@ export class RoomStore {
     return `${roomId}:${state}`;
   }
 
-  // 返回本轮产生/升级/消除的变化，供广播
-  tickAlerts() {
-    return this._evaluateAlerts(false);
+  // 解除某包厢全部进行中预警：保留确认人/备注等处理信息转入 resolvedAlerts
+  _resolveRoomAlerts(roomId, { reason, eventId } = {}) {
+    const changes = [];
+    for (const key of [...this.alerts.keys()]) {
+      if (!key.startsWith(`${roomId}:`)) continue;
+      const alert = this.alerts.get(key);
+      this.alerts.delete(key);
+      const resolved = {
+        ...alert,
+        status: ALERT_STATUS.RESOLVED,
+        resolvedAt: new Date(this.now()).toISOString(),
+        resolveReason: reason || null,
+        resolvedByEventId: eventId || null,
+      };
+      this.resolvedAlerts.unshift(resolved);
+      changes.push({ type: 'resolved', alert: resolved });
+    }
+    if (this.resolvedAlerts.length > RESOLVED_ALERTS_MAX) {
+      this.resolvedAlerts.length = RESOLVED_ALERTS_MAX;
+    }
+    return changes;
   }
 
-  _evaluateAlerts(transitionJustHappened) {
+  /**
+   * 值班经理确认预警（标记处理中并留下处理备注）；前台/保洁只读无权
+   * 幂等：已确认的预警仅更新备注（不重复确认）
+   */
+  acknowledgeAlert(alertKey, note, operator) {
+    if (!operator?.id || !operator?.name || !ROLE[operator.role]) {
+      throw new DomainError('操作人信息不完整', 401, 'UNAUTHORIZED');
+    }
+    if (operator.role !== ROLE.MANAGER) {
+      throw new DomainError('只有值班经理可以确认预警', 403, 'FORBIDDEN');
+    }
+    if (!note || !String(note).trim()) {
+      throw new DomainError('请填写处理备注');
+    }
+    const alert = this.alerts.get(alertKey);
+    if (!alert) throw new DomainError('预警不存在或已解除', 404, 'NOT_FOUND');
+
+    const now = new Date(this.now()).toISOString();
+    const firstAck = alert.status !== ALERT_STATUS.ACKNOWLEDGED;
+    const updated = {
+      ...alert,
+      status: ALERT_STATUS.ACKNOWLEDGED,
+      note: String(note).trim().slice(0, 500),
+      acknowledgedById: operator.id,
+      acknowledgedByName: operator.name,
+      acknowledgedAt: firstAck ? now : (alert.acknowledgedAt || now),
+    };
+    this.alerts.set(alertKey, updated);
+    this._persist();
+    this._emit('alerts', {
+      changes: [{ type: 'acknowledged', alert: updated }],
+      snapshot: this.snapshot().alerts,
+    });
+    return updated;
+  }
+
+  // 已解除预警历史（可按包厢过滤），按解除时间倒序
+  alertHistory(roomId = null, limit = 50) {
+    const list = roomId
+      ? this.resolvedAlerts.filter((a) => a.roomId === roomId)
+      : this.resolvedAlerts;
+    return list.slice(0, limit);
+  }
+
+  // 返回本轮产生/升级/消除的变化（不广播，由调用方统一 emit）
+  tickAlerts() {
+    const changes = this._evaluateAlerts();
+    if (changes.length) {
+      this._emit('alerts', { changes, snapshot: this.snapshot().alerts });
+    }
+    return changes;
+  }
+
+  _evaluateAlerts() {
     const changes = [];
     const activeKeys = new Set();
     for (const room of this.rooms.values()) {
@@ -479,6 +664,7 @@ export class RoomStore {
       if (!existing) {
         const alert = {
           key,
+          status: ALERT_STATUS.ACTIVE,
           roomId: room.id,
           roomName: room.name,
           state: room.state,
@@ -488,6 +674,10 @@ export class RoomStore {
           responsible: room.responsible,
           since: room.since,
           raisedAt: new Date(this.now()).toISOString(),
+          note: null,
+          acknowledgedById: null,
+          acknowledgedByName: null,
+          acknowledgedAt: null,
         };
         this.alerts.set(key, alert);
         changes.push({ type: 'raised', alert });
@@ -497,18 +687,28 @@ export class RoomStore {
           const updated = { ...existing, level, overdueSec, responsible: room.responsible };
           this.alerts.set(key, updated);
           if (level !== existing.level) changes.push({ type: 'escalated', alert: updated });
+          else changes.push({ type: 'updated', alert: updated });
         }
       }
     }
-    // 状态已变化/已恢复的预警自动消除
+    // 兜底：状态已变化/已恢复的单个预警自动解除（正常流转已由 _resolveRoomAlerts 先行处理）
     for (const key of [...this.alerts.keys()]) {
-      if (!activeKeys.has(key)) {
-        const alert = this.alerts.get(key);
-        this.alerts.delete(key);
-        changes.push({ type: 'resolved', alert });
-      }
+      if (activeKeys.has(key)) continue;
+      const alert = this.alerts.get(key);
+      this.alerts.delete(key);
+      const resolved = {
+        ...alert,
+        status: ALERT_STATUS.RESOLVED,
+        resolvedAt: new Date(this.now()).toISOString(),
+        resolveReason: 'state_change',
+        resolvedByEventId: null,
+      };
+      this.resolvedAlerts.unshift(resolved);
+      changes.push({ type: 'resolved', alert: resolved });
     }
-    if (changes.length) this._emit('alerts', { changes, snapshot: this.snapshot().alerts });
+    if (this.resolvedAlerts.length > RESOLVED_ALERTS_MAX) {
+      this.resolvedAlerts.length = RESOLVED_ALERTS_MAX;
+    }
     return changes;
   }
 }

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   RoomStore, DomainError, STATE, ACTION, ROLE,
-  STATE_LABEL, ACTION_LABEL, ROLE_LABEL,
+  STATE_LABEL, ACTION_LABEL, ROLE_LABEL, ALERT_STATUS, ALERT_STATUS_LABEL,
 } from './store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -27,6 +27,22 @@ store.seedIfEmpty([
   { id: 'R308', name: '308（大包）', seed: [ACTION.SUBMIT_CLEAN, STATE.CLEANING, STATE.INSPECTING, 400, '保洁-王姐'] },
 ]);
 
+// 给事件补充展示标签
+function decorateEvent(e) {
+  return {
+    ...e,
+    actionLabel: ACTION_LABEL[e.action],
+    fromStateLabel: e.fromState ? STATE_LABEL[e.fromState] : null,
+    toStateLabel: STATE_LABEL[e.toState],
+    operatorRoleLabel: ROLE_LABEL[e.operatorRole],
+  };
+}
+
+// 给预警补充状态标签
+function decorateAlert(a) {
+  return { ...a, statusLabel: ALERT_STATUS_LABEL[a.status] || a.status };
+}
+
 // 给快照补充当前角色可做动作（前端按自身角色取用）
 function decorateSnapshot(snap) {
   for (const room of snap.rooms) {
@@ -37,15 +53,25 @@ function decorateSnapshot(snap) {
     };
     room.stateLabel = STATE_LABEL[room.state];
   }
+  snap.alerts = (snap.alerts || []).map(decorateAlert);
+  snap.resolvedAlerts = (snap.resolvedAlerts || []).map(decorateAlert);
   return snap;
 }
 
 // ---- SSE 客户端 ----
 const sseClients = new Set();
 store.subscribe((type, payload) => {
+  let out = payload;
+  if (type === 'alerts') {
+    out = {
+      ...payload,
+      changes: payload.changes.map((c) => ({ ...c, alert: decorateAlert(c.alert) })),
+      snapshot: decorateSnapshot({ ...store.snapshot(), alerts: payload.snapshot }).alerts,
+    };
+  }
   // 流转事件带 SSE id：浏览器重连时会通过 Last-Event-ID 头自动回传，作为补齐游标
   const idLine = type === 'transition' && payload?.event?.id ? `id: ${payload.event.id}\n` : '';
-  const frame = `${idLine}event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
+  const frame = `${idLine}event: ${type}\ndata: ${JSON.stringify(out)}\n\n`;
   for (const res of sseClients) {
     try {
       // 建连期间（已注册但 hello 尚未发出）的帧先缓冲，hello 之后按序补发
@@ -141,17 +167,46 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && /^\/api\/rooms\/[^/]+\/history$/.test(p)) {
       const roomId = decodeURIComponent(p.split('/')[3]);
-      const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
-      const events = store.history(roomId, limit);
+      // 稳定游标分页 + 动作/操作人/时间范围筛选，按时间倒序
+      const { events, nextCursor, totalMatched, limit } = store.queryHistory(roomId, {
+        limit: url.searchParams.get('limit') ?? undefined,
+        cursor: url.searchParams.get('cursor'),
+        action: url.searchParams.get('action'),
+        operatorId: url.searchParams.get('operatorId'),
+        operatorName: url.searchParams.get('operator'),
+        from: url.searchParams.get('from'),
+        to: url.searchParams.get('to'),
+      });
       return sendJson(res, 200, {
         roomId,
-        events: events.map((e) => ({
-          ...e,
-          actionLabel: ACTION_LABEL[e.action],
-          fromStateLabel: e.fromState ? STATE_LABEL[e.fromState] : null,
-          toStateLabel: STATE_LABEL[e.toState],
-          operatorRoleLabel: ROLE_LABEL[e.operatorRole],
-        })),
+        events: events.map(decorateEvent),
+        nextCursor,
+        totalMatched,
+        limit,
+        hasMore: Boolean(nextCursor),
+        filters: {
+          action: url.searchParams.get('action'),
+          operator: url.searchParams.get('operator'),
+          from: url.searchParams.get('from'),
+          to: url.searchParams.get('to'),
+        },
+      });
+    }
+
+    // 值班经理确认预警（标记处理中 + 处理备注）
+    if (req.method === 'POST' && /^\/api\/alerts\/[^/]+\/ack$/.test(p)) {
+      const alertKey = decodeURIComponent(p.split('/')[3]);
+      const body = await readBody(req);
+      const alert = store.acknowledgeAlert(alertKey, body.note, operatorFromReq(req));
+      return sendJson(res, 200, { ok: true, alert });
+    }
+
+    // 已解除预警处理记录（可按包厢过滤），供交接查询
+    if (req.method === 'GET' && p === '/api/alerts/history') {
+      const roomId = url.searchParams.get('roomId');
+      const limit = parseLimit(url.searchParams.get('limit'), 50, 200);
+      return sendJson(res, 200, {
+        alerts: store.alertHistory(roomId, limit).map(decorateAlert),
       });
     }
 

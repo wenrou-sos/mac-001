@@ -39,12 +39,18 @@
   @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
   .alerts { margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px; }
   .alert {
-    display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 10px;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 12px; border-radius: 10px;
     background: rgba(245,185,66,.12); border: 1px solid rgba(245,185,66,.4); font-size: 13px;
   }
   .alert.critical { background: rgba(255,77,109,.14); border-color: rgba(255,77,109,.5); }
   .alert .tag { font-weight: 700; }
   .alert .time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .alert.ack { background: rgba(66,165,245,.10); border-color: rgba(66,165,245,.45); }
+  .alert .astatus { font-size: 11px; padding: 1px 8px; border-radius: 999px; font-weight: 700;
+    background: rgba(245,185,66,.2); color: var(--warn); white-space: nowrap; }
+  .alert.ack .astatus { background: rgba(66,165,245,.2); color: var(--cleaning); }
+  .alert .note { width: 100%; color: #b8d8ff; }
+  .alert .ackbtn { white-space: nowrap; }
   .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
   .card {
     background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
@@ -96,7 +102,22 @@
   .modal textarea { width: 100%; min-height: 88px; resize: vertical; }
   .modal .btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
   /* history modal */
-  .history { width: 640px; max-height: 80vh; overflow-y: auto; }
+  .history { width: 720px; max-height: 84vh; overflow-y: auto; }
+  .filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 10px 0 6px; }
+  .filters select, .filters input { font-size: 12.5px; padding: 6px 8px; }
+  .filters .flabel { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--muted); }
+  .filters .flabel input { width: 155px; }
+  .filter-summary { font-size: 12px; color: var(--muted); margin: 2px 0 8px; }
+  .filter-summary b { color: var(--text); }
+  .pager { text-align: center; margin: 10px 0 4px; }
+  .pager button { font-size: 12.5px; }
+  .history-section { margin-top: 14px; border-top: 1px dashed var(--line); padding-top: 10px; }
+  .history-section h4 { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .alert-history { display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; }
+  .alert-history .ah-item { padding: 7px 9px; border: 1px solid var(--line); border-radius: 8px; }
+  .alert-history .ah-row1 { display: flex; gap: 8px; }
+  .alert-history .ah-note { color: #b8d8ff; }
+  .alert-history .ah-muted { color: var(--muted); }
   table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
   th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
   th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
@@ -164,11 +185,48 @@
 <div id="historyModal" class="modal-mask">
   <div class="modal history">
     <h3 id="historyTitle"></h3>
+    <div class="filters">
+      <select id="fAction">
+        <option value="">全部动作</option>
+        <option value="CHECK_IN">开房</option>
+        <option value="CHECK_OUT">退房</option>
+        <option value="CLAIM">接单清洁</option>
+        <option value="RELEASE_CLAIM">放弃接单</option>
+        <option value="SUBMIT_CLEAN">清洁报检</option>
+        <option value="PASS_INSPECTION">检查通过</option>
+        <option value="REJECT_INSPECTION">检查不通过</option>
+        <option value="ROLLBACK">异常退回</option>
+      </select>
+      <input id="fOperator" placeholder="操作人姓名（模糊）" style="width:150px">
+      <label class="flabel">起 <input type="datetime-local" id="fFrom"></label>
+      <label class="flabel">止 <input type="datetime-local" id="fTo"></label>
+      <button class="primary" id="fSearch">查询</button>
+      <button class="ghost" id="fReset">重置</button>
+    </div>
+    <div id="fSummary" class="filter-summary"></div>
     <table>
       <thead><tr><th>时间</th><th>动作</th><th>流转</th><th>操作人</th><th>交接责任人</th><th>原因</th></tr></thead>
       <tbody id="historyBody"></tbody>
     </table>
+    <div id="historyPager" class="pager"></div>
+    <div class="history-section">
+      <h4>该包厢预警处理记录</h4>
+      <div id="alertHistoryBody" class="alert-history">暂无记录</div>
+    </div>
     <div class="btns"><button class="ghost" onclick="document.getElementById('historyModal').classList.remove('show')">关闭</button></div>
+  </div>
+</div>
+
+<!-- 预警确认弹窗 -->
+<div id="ackModal" class="modal-mask">
+  <div class="modal">
+    <h3>确认处理预警</h3>
+    <p id="ackHint"></p>
+    <textarea id="ackInput" placeholder="请填写处理备注（如已联系保洁加急、现场跟进情况，将随预警留痕，必填）"></textarea>
+    <div class="btns">
+      <button class="ghost" onclick="closeAck()">取消</button>
+      <button class="primary" id="ackConfirm">确认并标记处理中</button>
+    </div>
   </div>
 </div>
 
@@ -244,7 +302,17 @@ function connectSSE() {
       toast(`「${room.name}」被 ${event.operatorName} 更新：${stateLabel(event.toState)}`, 'ok');
     }
   });
-  es.addEventListener('alerts', () => fetchSnapshot());
+  es.addEventListener('alerts', (e) => {
+    // 预警确认/解除/升级通过现有 SSE 实时同步
+    const data = JSON.parse(e.data);
+    state = state || {};
+    state.alerts = data.snapshot || [];
+    renderAlerts();
+    // 交接记录弹窗打开时，同步刷新其预警处理记录区
+    if (hist && document.getElementById('historyModal').classList.contains('show')) {
+      renderAlertHistory(hist.roomId);
+    }
+  });
   es.onopen = () => setConn(true);
   es.onerror = () => { setConn(false); setTimeout(() => { es.close(); connectSSE(); }, 3000); };
 }
@@ -328,14 +396,53 @@ function renderAlerts() {
   const alerts = (state.alerts || []).slice().sort((a, b) =>
     (a.level === 'CRITICAL' ? 0 : 1) - (b.level === 'CRITICAL' ? 0 : 1));
   if (!alerts.length) { box.innerHTML = ''; return; }
-  box.innerHTML = alerts.map(a => `
-    <div class="alert ${a.level === 'CRITICAL' ? 'critical' : ''}">
+  const isManager = roleEl.value === 'MANAGER';
+  box.innerHTML = alerts.map(a => {
+    const acked = a.status === 'ACKNOWLEDGED';
+    return `
+    <div class="alert ${a.level === 'CRITICAL' ? 'critical' : ''} ${acked ? 'ack' : ''}">
       <span class="tag">${a.level === 'CRITICAL' ? '⛔ 严重超时' : '⚠️ 超时提醒'}</span>
+      <span class="astatus">${a.statusLabel || (acked ? '处理中' : '待处理')}</span>
       <span><b>${a.roomName}</b> ${stateLabel(a.state)} 已超时 <b>${fmtDur(a.overdueSec)}</b>
         （时限 ${fmtDur(a.limitSec)}），责任人：${a.responsible?.name || '—'}</span>
       <span class="time">${fmtClock(a.raisedAt)} 触发</span>
-    </div>`).join('');
+      ${isManager && !acked ? `<button class="primary ackbtn" data-ack="${a.key}">确认处理</button>` : ''}
+      ${acked ? `<span class="note">🧰 ${escapeHtml(a.acknowledgedByName || '')} 已确认（${fmtClock(a.acknowledgedAt)}）：${escapeHtml(a.note || '')}</span>` : ''}
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-ack]').forEach(btn => {
+    btn.onclick = () => openAck(btn.dataset.ack);
+  });
 }
+
+// ---- 预警确认（仅经理）----
+let ackKey = null;
+function openAck(key) {
+  const alert = (state.alerts || []).find(a => a.key === key);
+  if (!alert) return;
+  ackKey = key;
+  document.getElementById('ackHint').textContent =
+    `${alert.roomName} · ${stateLabel(alert.state)}超时 ${fmtDur(alert.overdueSec)}，确认后该预警标记为“处理中”并同步给所有看板。`;
+  document.getElementById('ackInput').value = '';
+  document.getElementById('ackModal').classList.add('show');
+  document.getElementById('ackInput').focus();
+}
+function closeAck() { ackKey = null; document.getElementById('ackModal').classList.remove('show'); }
+document.getElementById('ackConfirm').onclick = async () => {
+  const note = document.getElementById('ackInput').value.trim();
+  if (!note) return toast('请填写处理备注', 'warn');
+  const key = ackKey; closeAck();
+  try {
+    const res = await fetch(`/api/alerts/${encodeURIComponent(key)}/ack`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', ...operator() },
+      body: JSON.stringify({ note }),
+    });
+    const body = await res.json();
+    if (!res.ok) return toast(body.error || '确认失败', 'error');
+    toast('已标记处理中并同步', 'ok');
+    await fetchSnapshot();
+  } catch (e) { toast('网络错误：' + e.message, 'error'); }
+};
 function stateLabel(s) {
   return { IN_USE: '使用中', TO_CLEAN: '待清洁', CLEANING: '清洁中', INSPECTING: '检查中', OPEN: '可开放' }[s];
 }
@@ -414,22 +521,134 @@ async function postTransition(room, action, reason) {
   }
 }
 
+// ---- 交接记录：筛选 + 稳定游标分页 ----
+const PAGE_SIZE = 20;
+let hist = null; // { roomId, filters, events:Set(去重), nextCursor, loading, totalMatched }
+
+function histFilters() {
+  return {
+    action: document.getElementById('fAction').value,
+    operator: document.getElementById('fOperator').value.trim(),
+    from: document.getElementById('fFrom').value,
+    to: document.getElementById('fTo').value,
+  };
+}
+function histQueryUrl(cursor) {
+  const f = hist.filters;
+  const q = new URLSearchParams({ limit: String(PAGE_SIZE) });
+  if (cursor) q.set('cursor', cursor);
+  if (f.action) q.set('action', f.action);
+  if (f.operator) q.set('operator', f.operator);
+  if (f.from) q.set('from', new Date(f.from).toISOString());
+  if (f.to) q.set('to', new Date(f.to).toISOString());
+  return `/api/rooms/${encodeURIComponent(hist.roomId)}/history?${q}`;
+}
+function renderHistRows() {
+  const body = document.getElementById('historyBody');
+  if (!hist.events.length) {
+    body.innerHTML = '<tr><td colspan="6" style="color:var(--muted)">当前筛选条件下暂无记录</td></tr>';
+  } else {
+    body.innerHTML = hist.events.map(ev => `
+      <tr>
+        <td>${new Date(ev.at).toLocaleString('zh-CN', { hour12: false })}</td>
+        <td>${ev.actionLabel}</td>
+        <td>${ev.fromStateLabel ? ev.fromStateLabel + ' → ' : ''}${ev.toStateLabel}<br>
+          <span style="color:var(--muted)">v${ev.version}</span></td>
+        <td>${ev.operatorName}<br><span style="color:var(--muted)">${ev.operatorRoleLabel}</span></td>
+        <td>${ev.toResponsible}</td>
+        <td class="reason">${ev.reason ? escapeHtml(ev.reason) : '—'}</td>
+      </tr>`).join('');
+  }
+  const f = hist.filters;
+  const chips = [];
+  if (f.action) chips.push(`动作=<b>${actionLabel(f.action)}</b>`);
+  if (f.operator) chips.push(`操作人含=<b>${escapeHtml(f.operator)}</b>`);
+  if (f.from) chips.push(`起=<b>${f.from.replace('T', ' ')}</b>`);
+  if (f.to) chips.push(`止=<b>${f.to.replace('T', ' ')}</b>`);
+  document.getElementById('fSummary').innerHTML =
+    `已加载 <b>${hist.events.length}</b> / 命中 <b>${hist.totalMatched}</b> 条` +
+    (chips.length ? `　筛选：${chips.join('，')}` : '　（全部记录）');
+  const pager = document.getElementById('historyPager');
+  pager.innerHTML = hist.nextCursor
+    ? `<button class="primary" id="loadMoreHist" ${hist.loading ? 'disabled' : ''}>${hist.loading ? '加载中…' : '加载更早记录'}</button>`
+    : (hist.events.length ? '<span style="color:var(--muted);font-size:12px">— 已到最早记录 —</span>' : '');
+  if (hist.nextCursor) document.getElementById('loadMoreHist').onclick = loadMoreHist;
+}
+async function loadMoreHist() {
+  if (hist.loading || !hist.nextCursor) return;
+  hist.loading = true;
+  renderHistRows();
+  try {
+    const res = await fetch(histQueryUrl(hist.nextCursor));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '加载失败');
+    const known = new Set(hist.events.map(e => e.id));
+    for (const ev of data.events) if (!known.has(ev.id)) { known.add(ev.id); hist.events.push(ev); }
+    hist.nextCursor = data.nextCursor;
+    hist.totalMatched = data.totalMatched;
+  } catch (e) { toast(e.message, 'error'); }
+  hist.loading = false;
+  renderHistRows();
+}
+async function runHistSearch(resetPager) {
+  if (resetPager) {
+    hist.filters = histFilters();
+    hist.nextCursor = null;
+    hist.events = [];
+  }
+  hist.loading = true;
+  renderHistRows();
+  try {
+    const res = await fetch(histQueryUrl(hist.nextCursor));
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || '查询失败');
+    const known = new Set(hist.events.map(e => e.id));
+    for (const ev of data.events) if (!known.has(ev.id)) { known.add(ev.id); hist.events.push(ev); }
+    hist.nextCursor = data.nextCursor;
+    hist.totalMatched = data.totalMatched;
+  } catch (e) { toast(e.message, 'error'); }
+  hist.loading = false;
+  renderHistRows();
+}
+async function renderAlertHistory(roomId) {
+  const box = document.getElementById('alertHistoryBody');
+  box.textContent = '加载中…';
+  try {
+    const res = await fetch(`/api/alerts/history?roomId=${encodeURIComponent(roomId)}&limit=50`);
+    const data = await res.json();
+    if (!data.alerts.length) { box.textContent = '暂无记录'; return; }
+    box.innerHTML = data.alerts.map(a => `
+      <div class="ah-item">
+        <div class="ah-row1">
+          <span class="astatus">${a.statusLabel || '已解除'}</span>
+          <b>${stateLabel(a.state)}超时</b>
+          <span class="ah-muted">${new Date(a.raisedAt).toLocaleString('zh-CN', { hour12: false })} 触发
+            → ${new Date(a.resolvedAt).toLocaleString('zh-CN', { hour12: false })} 随状态流转解除</span>
+        </div>
+        ${a.acknowledgedByName ? `<div class="ah-note">🧰 ${escapeHtml(a.acknowledgedByName)} 于 ${new Date(a.acknowledgedAt).toLocaleString('zh-CN', { hour12: false })} 确认：${escapeHtml(a.note || '')}</div>` : '<div class="ah-muted">解除前未经经理确认</div>'}
+      </div>`).join('');
+  } catch { box.textContent = '加载失败'; }
+}
+
 async function showHistory(room) {
   document.getElementById('historyTitle').textContent = `${room.name} · 交接记录`;
-  const res = await fetch(`/api/rooms/${room.id}/history?limit=100`);
-  const data = await res.json();
-  document.getElementById('historyBody').innerHTML = data.events.map(ev => `
-    <tr>
-      <td>${new Date(ev.at).toLocaleString('zh-CN', { hour12: false })}</td>
-      <td>${ev.actionLabel}</td>
-      <td>${ev.fromStateLabel ? ev.fromStateLabel + ' → ' : ''}${ev.toStateLabel}<br>
-        <span style="color:var(--muted)">v${ev.version}</span></td>
-      <td>${ev.operatorName}<br><span style="color:var(--muted)">${ev.operatorRoleLabel}</span></td>
-      <td>${ev.toResponsible}</td>
-      <td class="reason">${ev.reason ? escapeHtml(ev.reason) : '—'}</td>
-    </tr>`).join('') || '<tr><td colspan="6" style="color:var(--muted)">暂无记录</td></tr>';
+  // 新包厢：保留上次选择的筛选条件，由 histFilters() 读取当前控件值
+  hist = { roomId: room.id, filters: histFilters(), events: [], nextCursor: null, loading: false, totalMatched: 0 };
+  document.getElementById('historyBody').innerHTML = '';
+  document.getElementById('alertHistoryBody').textContent = '加载中…';
+  document.getElementById('historyPager').innerHTML = '';
+  document.getElementById('fSummary').textContent = '';
   document.getElementById('historyModal').classList.add('show');
+  await Promise.all([runHistSearch(false), renderAlertHistory(room.id)]);
 }
+document.getElementById('fSearch').onclick = () => runHistSearch(true);
+document.getElementById('fReset').onclick = () => {
+  document.getElementById('fAction').value = '';
+  document.getElementById('fOperator').value = '';
+  document.getElementById('fFrom').value = '';
+  document.getElementById('fTo').value = '';
+  runHistSearch(true);
+};
 
 // ---- toast ----
 function toast(msg, kind = '') {
