@@ -1,0 +1,15 @@
+{
+  "name": "mac-001",
+  "version": "1.0.0",
+  "description": "KTV 包厢状态同步与交接记录系统（前台/保洁/值班经理）",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "SLA_CLAIM_SECONDS=60 SLA_CLEAN_SECONDS=120 SLA_INSPECT_SECONDS=90 node src/server.js",
+    "test": "node --test test/"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mac-001 · KTV 包厢状态看板</title>
+<style>
+  :root {
+    --bg: #0f1220; --panel: #181c2e; --panel2: #1f2440; --line: #2a3050;
+    --text: #e8eaf6; --muted: #9aa0c3;
+    --in-use: #ff7a59; --to-clean: #f5b942; --cleaning: #42a5f5;
+    --inspecting: #ab7df7; --open: #37c978;
+    --danger: #ff4d6d; --warn: #f5b942;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header h1 { font-size: 17px; white-space: nowrap; }
+  .conn { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--open); }
+  .dot.off { background: var(--danger); }
+  .identity { display: flex; gap: 8px; margin-left: auto; align-items: center; flex-wrap: wrap; }
+  select, input, button, textarea {
+    font: inherit; color: var(--text); background: var(--panel2);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px;
+  }
+  button { cursor: pointer; transition: filter .15s, transform .05s; }
+  button:hover { filter: brightness(1.25); }
+  button:active { transform: scale(.97); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { background: #3d5afe; border-color: #3d5afe; }
+  button.danger { background: #b3261e; border-color: #b3261e; }
+  button.ghost { background: transparent; }
+  .layout { display: grid; grid-template-columns: 1fr 360px; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 1000px) { .layout { grid-template-columns: 1fr; } }
+  .alerts { margin-bottom: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .alert {
+    display: flex; gap: 10px; align-items: center; padding: 10px 12px; border-radius: 10px;
+    background: rgba(245,185,66,.12); border: 1px solid rgba(245,185,66,.4); font-size: 13px;
+  }
+  .alert.critical { background: rgba(255,77,109,.14); border-color: rgba(255,77,109,.5); }
+  .alert .tag { font-weight: 700; }
+  .alert .time { margin-left: auto; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 14px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px; border-left-width: 4px; display: flex; flex-direction: column; gap: 10px;
+  }
+  .card.s-IN_USE { border-left-color: var(--in-use); }
+  .card.s-TO_CLEAN { border-left-color: var(--to-clean); }
+  .card.s-CLEANING { border-left-color: var(--cleaning); }
+  .card.s-INSPECTING { border-left-color: var(--inspecting); }
+  .card.s-OPEN { border-left-color: var(--open); }
+  .card h3 { font-size: 15px; display: flex; align-items: center; gap: 8px; }
+  .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
+  .b-IN_USE { background: rgba(255,122,89,.18); color: var(--in-use); }
+  .b-TO_CLEAN { background: rgba(245,185,66,.18); color: var(--to-clean); }
+  .b-CLEANING { background: rgba(66,165,245,.18); color: var(--cleaning); }
+  .b-INSPECTING { background: rgba(171,125,247,.18); color: var(--inspecting); }
+  .b-OPEN { background: rgba(55,201,120,.18); color: var(--open); }
+  .meta { font-size: 12.5px; color: var(--muted); display: flex; flex-direction: column; gap: 3px; }
+  .meta b { color: var(--text); font-weight: 600; }
+  .timer { font-variant-numeric: tabular-nums; }
+  .timer.overdue { color: var(--warn); font-weight: 700; }
+  .timer.critical { color: var(--danger); font-weight: 700; }
+  .card.has-alert { box-shadow: 0 0 0 1px rgba(255,77,109,.5); }
+  .actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: auto; }
+  .actions button { font-size: 12.5px; padding: 6px 10px; }
+  .side { display: flex; flex-direction: column; gap: 14px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+  .panel h2 { font-size: 14px; margin-bottom: 10px; color: var(--muted); letter-spacing: .5px; }
+  .feed { display: flex; flex-direction: column; gap: 0; max-height: 62vh; overflow-y: auto; }
+  .feed .item { padding: 9px 0; border-bottom: 1px dashed var(--line); font-size: 12.5px; }
+  .feed .item:last-child { border-bottom: 0; }
+  .feed .row1 { display: flex; justify-content: space-between; gap: 8px; }
+  .feed .who { font-weight: 600; }
+  .feed .t { color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .feed .row2 { color: var(--muted); margin-top: 2px; }
+  .feed .reason { color: #ffb4b4; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; font-size: 12px; color: var(--muted); }
+  .legend span { display: flex; align-items: center; gap: 5px; }
+  .legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  /* modal */
+  .modal-mask {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55); display: none;
+    align-items: center; justify-content: center; z-index: 50;
+  }
+  .modal-mask.show { display: flex; }
+  .modal { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; width: 420px; max-width: 92vw; padding: 20px; }
+  .modal h3 { margin-bottom: 12px; }
+  .modal p { color: var(--muted); font-size: 13px; margin-bottom: 10px; }
+  .modal textarea { width: 100%; min-height: 88px; resize: vertical; }
+  .modal .btns { display: flex; justify-content: flex-end; gap: 10px; margin-top: 14px; }
+  /* history modal */
+  .history { width: 640px; max-height: 80vh; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; position: sticky; top: 0; background: var(--panel); }
+  /* toasts */
+  #toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 10px; z-index: 100; }
+  .toast {
+    padding: 11px 16px; border-radius: 10px; background: var(--panel2);
+    border: 1px solid var(--line); box-shadow: 0 8px 24px rgba(0,0,0,.4); font-size: 13px;
+    animation: slide .2s ease; max-width: 340px;
+  }
+  .toast.error { border-color: var(--danger); }
+  .toast.warn { border-color: var(--warn); }
+  .toast.ok { border-color: var(--open); }
+  @keyframes slide { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎤 mac-001 · KTV 包厢状态看板</h1>
+  <span class="legend">
+    <span><i style="background:var(--in-use)"></i>使用中</span>
+    <span><i style="background:var(--to-clean)"></i>待清洁</span>
+    <span><i style="background:var(--cleaning)"></i>清洁中</span>
+    <span><i style="background:var(--inspecting)"></i>检查中</span>
+    <span><i style="background:var(--open)"></i>可开放</span>
+  </span>
+  <div class="identity">
+    <span class="conn"><span id="connDot" class="dot"></span><span id="connText">实时连接中</span></span>
+    <select id="role">
+      <option value="FRONT">前台</option>
+      <option value="CLEANER">保洁</option>
+      <option value="MANAGER">值班经理</option>
+    </select>
+    <input id="userName" placeholder="姓名" style="width:110px">
+  </div>
+</header>
+
+<div class="layout">
+  <main>
+    <div id="alerts" class="alerts"></div>
+    <div id="grid" class="grid"></div>
+  </main>
+  <aside class="side">
+    <div class="panel">
+      <h2>交接动态（实时）</h2>
+      <div id="feed" class="feed"></div>
+    </div>
+  </aside>
+</div>
+
+<!-- 原因填写弹窗 -->
+<div id="reasonModal" class="modal-mask">
+  <div class="modal">
+    <h3 id="reasonTitle"></h3>
+    <p id="reasonHint"></p>
+    <textarea id="reasonInput" placeholder="请填写原因（将记入交接记录，必填）"></textarea>
+    <div class="btns">
+      <button class="ghost" onclick="closeReason()">取消</button>
+      <button class="primary danger" id="reasonConfirm">确认提交</button>
+    </div>
+  </div>
+</div>
+
+<!-- 交接记录弹窗 -->
+<div id="historyModal" class="modal-mask">
+  <div class="modal history">
+    <h3 id="historyTitle"></h3>
+    <table>
+      <thead><tr><th>时间</th><th>动作</th><th>流转</th><th>操作人</th><th>交接责任人</th><th>原因</th></tr></thead>
+      <tbody id="historyBody"></tbody>
+    </table>
+    <div class="btns"><button class="ghost" onclick="document.getElementById('historyModal').classList.remove('show')">关闭</button></div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script>
+const ACTIONS_NEED_REASON = new Set(['REJECT_INSPECTION', 'ROLLBACK']);
+const ACTION_BTN_CLASS = {
+  CHECK_IN: 'primary', PASS_INSPECTION: 'primary',
+  REJECT_INSPECTION: 'danger', ROLLBACK: 'danger',
+};
+
+let state = null;
+const feedItems = [];
+
+// ---- 身份（演示：直接由前端设置；生产由服务端会话解析）----
+const PRESET_NAME = { FRONT: '前台-小林', CLEANER: '保洁-王姐', MANAGER: '值班经理-老赵' };
+const roleEl = document.getElementById('role');
+const nameEl = document.getElementById('userName');
+roleEl.value = localStorage.getItem('role') || 'FRONT';
+nameEl.value = localStorage.getItem('userName') || PRESET_NAME[roleEl.value];
+roleEl.onchange = () => { nameEl.value = PRESET_NAME[roleEl.value]; saveIdentity(); render(); };
+nameEl.onchange = saveIdentity;
+function saveIdentity() {
+  localStorage.setItem('role', roleEl.value);
+  localStorage.setItem('userName', nameEl.value.trim() || PRESET_NAME[roleEl.value]);
+}
+function operator() {
+  const role = roleEl.value;
+  const name = nameEl.value.trim() || PRESET_NAME[role];
+  return { 'X-Role': role, 'X-User-Name': name, 'X-User-Id': `${role}:${name}` };
+}
+
+// ---- 拉取 / 推送 ----
+async function fetchSnapshot() {
+  const res = await fetch('/api/rooms');
+  state = await res.json();
+  render();
+}
+
+function connectSSE() {
+  const es = new EventSource('/api/events');
+  es.addEventListener('hello', (e) => { state = JSON.parse(e.data); setConn(true); render(); });
+  es.addEventListener('transition', (e) => {
+    const { event, room } = JSON.parse(e.data);
+    feedItems.unshift(event);
+    if (feedItems.length > 100) feedItems.pop();
+    fetchSnapshot();
+    if (event.operatorId !== operator()['X-User-Id']) {
+      toast(`「${room.name}」被 ${event.operatorName} 更新：${stateLabel(event.toState)}`, 'ok');
+    }
+  });
+  es.addEventListener('alerts', () => fetchSnapshot());
+  es.onopen = () => setConn(true);
+  es.onerror = () => { setConn(false); setTimeout(() => { es.close(); connectSSE(); }, 3000); };
+}
+function setConn(ok) {
+  document.getElementById('connDot').classList.toggle('off', !ok);
+  document.getElementById('connText').textContent = ok ? '实时连接中' : '连接断开，重连中…';
+}
+
+// ---- 渲染 ----
+function fmtClock(iso) {
+  const d = new Date(iso);
+  return d.toLocaleTimeString('zh-CN', { hour12: false });
+}
+function elapsed(iso) {
+  return Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+}
+function fmtDur(sec) {
+  sec = Math.floor(sec);
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  return h ? `${h}h${m}m` : m ? `${m}m${s}s` : `${s}s`;
+}
+function roomAlert(roomId) {
+  return (state?.alerts || []).find(a => a.roomId === roomId);
+}
+function timerClass(room, al) {
+  if (!state.sla[room.state] || !room.since) return '';
+  if (al) return al.level === 'CRITICAL' ? 'critical' : 'overdue';
+  const e = elapsed(room.since);
+  if (e >= state.sla[room.state] * 2) return 'critical';
+  if (e >= state.sla[room.state]) return 'overdue';
+  return '';
+}
+
+function render() {
+  if (!state) return;
+  renderAlerts();
+  const grid = document.getElementById('grid');
+  const role = roleEl.value;
+  grid.innerHTML = '';
+  for (const room of state.rooms) {
+    const al = roomAlert(room.id);
+    const card = document.createElement('div');
+    card.className = `card s-${room.state}${al ? ' has-alert' : ''}`;
+    const actions = room.allowedByRole[role] || [];
+    const sla = state.sla[room.state];
+    card.innerHTML = `
+      <h3>${room.name}
+        <span class="badge b-${room.state}">${room.stateLabel}</span>
+        <span style="margin-left:auto;font-size:11px;color:var(--muted)">v${room.version}</span>
+      </h3>
+      <div class="meta">
+        <span>当前责任人：<b>${room.responsible?.name || '—'}</b></span>
+        <span>进入状态：${room.since ? fmtClock(room.since) : '—'}</span>
+        <span>停留：<span class="timer ${timerClass(room, al)}" data-since="${room.since || ''}" data-sla="${sla || ''}">
+          ${room.since ? fmtDur(elapsed(room.since)) : ''}
+        </span>${sla ? `（时限 ${fmtDur(sla)}）` : ''}</span>
+      </div>
+      <div class="actions">
+        ${actions.map(a => `<button class="${ACTION_BTN_CLASS[a] || ''}" data-action="${a}">${actionLabel(a)}</button>`).join('')}
+        <button class="ghost" data-history>交接记录</button>
+      </div>`;
+    card.querySelectorAll('[data-action]').forEach(btn => {
+      btn.onclick = () => doAction(room, btn.dataset.action);
+    });
+    card.querySelector('[data-history]').onclick = () => showHistory(room);
+    grid.appendChild(card);
+  }
+  renderFeed();
+}
+
+function actionLabel(a) {
+  return {
+    CHECK_IN: '开房', CHECK_OUT: '退房', CLAIM: '接单清洁', RELEASE_CLAIM: '放弃接单',
+    SUBMIT_CLEAN: '清洁报检', PASS_INSPECTION: '检查通过', REJECT_INSPECTION: '检查不通过',
+    ROLLBACK: '异常退回',
+  }[a];
+}
+
+function renderAlerts() {
+  const box = document.getElementById('alerts');
+  const alerts = (state.alerts || []).slice().sort((a, b) =>
+    (a.level === 'CRITICAL' ? 0 : 1) - (b.level === 'CRITICAL' ? 0 : 1));
+  if (!alerts.length) { box.innerHTML = ''; return; }
+  box.innerHTML = alerts.map(a => `
+    <div class="alert ${a.level === 'CRITICAL' ? 'critical' : ''}">
+      <span class="tag">${a.level === 'CRITICAL' ? '⛔ 严重超时' : '⚠️ 超时提醒'}</span>
+      <span><b>${a.roomName}</b> ${stateLabel(a.state)} 已超时 <b>${fmtDur(a.overdueSec)}</b>
+        （时限 ${fmtDur(a.limitSec)}），责任人：${a.responsible?.name || '—'}</span>
+      <span class="time">${fmtClock(a.raisedAt)} 触发</span>
+    </div>`).join('');
+}
+function stateLabel(s) {
+  return { IN_USE: '使用中', TO_CLEAN: '待清洁', CLEANING: '清洁中', INSPECTING: '检查中', OPEN: '可开放' }[s];
+}
+
+function renderFeed() {
+  const box = document.getElementById('feed');
+  if (!feedItems.length) { box.innerHTML = '<div style="color:var(--muted);font-size:12.5px">暂无动态，操作后将在此显示</div>'; return; }
+  box.innerHTML = feedItems.slice(0, 30).map(ev => `
+    <div class="item">
+      <div class="row1">
+        <span class="who">${ev.operatorName}（${roleLabel(ev.operatorRole)}）→ ${ev.toResponsible}</span>
+        <span class="t">${fmtClock(ev.at)}</span>
+      </div>
+      <div class="row2">
+        ${roomName(ev.roomId)} · ${actionLabel(ev.action)}
+        ${ev.fromState ? `${stateLabel(ev.fromState)} → ` : ''}${stateLabel(ev.toState)}
+        ${ev.reason ? ` · <span class="reason">原因：${escapeHtml(ev.reason)}</span>` : ''}
+        ${ev.idempotencyKey && ev.idempotencyKey.startsWith('idem-retry') ? ' · 重试命中' : ''}
+      </div>
+    </div>`).join('');
+}
+function roleLabel(r) { return { FRONT: '前台', CLEANER: '保洁', MANAGER: '值班经理' }[r] || r; }
+function roomName(id) { return state?.rooms?.find(r => r.id === id)?.name || id; }
+function escapeHtml(s) { return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+// ---- 操作 ----
+let pending = null;
+function doAction(room, action) {
+  const exec = (reason) => postTransition(room, action, reason);
+  if (ACTIONS_NEED_REASON.has(action)) {
+    pending = { room, action };
+    document.getElementById('reasonTitle').textContent =
+      `${actionLabel(action)}：${room.name}（v${room.version} → v${room.version + 1}）`;
+    document.getElementById('reasonHint').textContent =
+      action === 'ROLLBACK'
+        ? `当前「${room.stateLabel}」将退回到上一状态，并恢复原责任人。该操作仅值班经理可用，会永久留痕。`
+        : '检查不通过将退回原保洁返工，请说明不通过原因。';
+    document.getElementById('reasonInput').value = '';
+    document.getElementById('reasonModal').classList.add('show');
+    document.getElementById('reasonInput').focus();
+  } else {
+    exec(null);
+  }
+}
+document.getElementById('reasonConfirm').onclick = async () => {
+  const reason = document.getElementById('reasonInput').value.trim();
+  if (!reason) return toast('请填写原因', 'warn');
+  const p = pending; pending = null;
+  document.getElementById('reasonModal').classList.remove('show');
+  if (p) await postTransition(p.room, p.action, reason);
+};
+function closeReason() { pending = null; document.getElementById('reasonModal').classList.remove('show'); }
+
+async function postTransition(room, action, reason) {
+  const idem = 'idem-' + Math.random().toString(36).slice(2, 10);
+  try {
+    const res = await fetch(`/api/rooms/${room.id}/transitions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...operator(), 'Idempotency-Key': idem },
+      body: JSON.stringify({ action, expectedVersion: room.version, reason, idempotencyKey: idem }),
+    });
+    const body = await res.json();
+    if (!res.ok) {
+      if (body.code === 'VERSION_CONFLICT') {
+        toast(`⛔ ${body.error}`, 'error');
+        await fetchSnapshot();
+      } else {
+        toast(body.error || '操作失败', 'error');
+      }
+      return;
+    }
+    toast(body.duplicated ? '重复请求已幂等处理' : '操作成功', 'ok');
+    await fetchSnapshot();
+  } catch (e) {
+    toast('网络错误：' + e.message, 'error');
+  }
+}
+
+async function showHistory(room) {
+  document.getElementById('historyTitle').textContent = `${room.name} · 交接记录`;
+  const res = await fetch(`/api/rooms/${room.id}/history?limit=100`);
+  const data = await res.json();
+  document.getElementById('historyBody').innerHTML = data.events.map(ev => `
+    <tr>
+      <td>${new Date(ev.at).toLocaleString('zh-CN', { hour12: false })}</td>
+      <td>${ev.actionLabel}</td>
+      <td>${ev.fromStateLabel ? ev.fromStateLabel + ' → ' : ''}${ev.toStateLabel}<br>
+        <span style="color:var(--muted)">v${ev.version}</span></td>
+      <td>${ev.operatorName}<br><span style="color:var(--muted)">${ev.operatorRoleLabel}</span></td>
+      <td>${ev.toResponsible}</td>
+      <td class="reason">${ev.reason ? escapeHtml(ev.reason) : '—'}</td>
+    </tr>`).join('') || '<tr><td colspan="6" style="color:var(--muted)">暂无记录</td></tr>';
+  document.getElementById('historyModal').classList.add('show');
+}
+
+// ---- toast ----
+function toast(msg, kind = '') {
+  const el = document.createElement('div');
+  el.className = `toast ${kind}`;
+  el.textContent = msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, 3600);
+}
+
+// 倒计时每秒刷新（纯前端展示，不改变状态）
+setInterval(() => {
+  document.querySelectorAll('.timer[data-since]').forEach(el => {
+    const since = el.dataset.since;
+    if (since) el.textContent = fmtDur(elapsed(since));
+  });
+}, 1000);
+
+saveIdentity();
+fetchSnapshot();
+connectSSE();
+</script>
+</body>
+</html>
